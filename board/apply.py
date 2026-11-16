@@ -66,7 +66,7 @@ def main() -> None:
   DEVICE_DTS := mt7981-nradio-nbcpe
   DEVICE_DTS_DIR := ../dts
   SUPPORTED_DEVICES += nradio,nbcpe
-  KERNEL_LOADADDR := 0x48000000
+  KERNEL_LOADADDR := 0x48080000
   DEVICE_PACKAGES := kmod-usb3 kmod-usb-serial-option kmod-usb-net-cdc-ether \\
 \tkmod-usb-net-cdc-ncm kmod-usb-net-huawei-cdc-ncm kmod-usb-net-rndis \\
 \tkmod-usb-net-qmi-wwan comgt-ncm uqmi \\

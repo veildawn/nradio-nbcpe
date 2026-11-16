@@ -139,7 +139,7 @@ def main() -> None:
         )
         pre_tmp.unlink(missing_ok=True)
 
-    # 1b. Assemble FIT kernel image (nradio_nbcpe-kernel.bin @ 0x48000000)
+    # 1b. Assemble FIT kernel image (nradio_nbcpe-kernel.bin @ 0x48080000)
     linux_dirs = sorted(kdir.glob("linux-*"))
     if not linux_dirs:
         sys.exit(f"ERROR: linux-* directory not found under {kdir}")
@@ -166,8 +166,8 @@ def main() -> None:
             "-k", str(kernel_lzma),
             "-C", "lzma",
             "-d", str(dtb_dst),
-            "-a", "0x48000000",
-            "-e", "0x48000000",
+            "-a", "0x48080000",
+            "-e", "0x48080000",
             "-c", "config-1",
             "-A", "arm64",
             "-v", linux_ver,
@@ -194,7 +194,7 @@ def main() -> None:
         "  DEVICE_DTS := mt7981-nradio-nbcpe\n"
         "  DEVICE_DTS_DIR := ../dts\n"
         "  SUPPORTED_DEVICES += nradio,nbcpe\n"
-        "  KERNEL_LOADADDR := 0x48000000\n"
+        "  KERNEL_LOADADDR := 0x48080000\n"
         f"  DEVICE_PACKAGES := {pkgs_joined}\n"
         "  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata\n"
         "endef\n"
