@@ -1,0 +1,214 @@
+name: OpenWrt ImageBuilder (NRadio NBCPE)
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      extra_packages:
+        description: "Space-separated OpenWrt packages to preinstall"
+        required: false
+        default: "luci luci-ssl luci-proto-ncm luci-i18n-base-zh-cn luci-i18n-firewall-zh-cn luci-i18n-package-manager-zh-cn iw-full usbutils picocom"
+      publish_release:
+        description: "Publish built sysupgrade.bin as a GitHub Release"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node for JavaScript checks
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Lint board scripts and Python tooling
+        run: |
+          python3 -m py_compile board/apply.py board/inject_imagebuilder.py board/platform_upgrade.py
+          find board/files/etc/board.d board/files/etc/init.d board/files/etc/hotplug.d board/files/etc/uci-defaults board/files/usr/sbin board/files/lib/functions board/files/lib/preinit -type f -print0 | xargs -0 -n 1 sh -n
+          for script in board/files/www/luci-static/resources/view/nradio/*.js; do
+            node --check "$script"
+          done
+          python3 - <<'PY'
+          import json, pathlib
+          for p in sorted(pathlib.Path('board/files').rglob('*.json')):
+              json.loads(p.read_text())
+              print('json ok:', p)
+          PY
+
+      - name: Test updater, modem snapshots and LuCI interactions
+        run: |
+          python3 -m pip install 'playwright>=1.50,<2'
+          python3 -m playwright install --with-deps chromium
+          python3 -m unittest discover -s tests -v
+
+      - name: Install host prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential device-tree-compiler file gawk libncurses-dev python3 rsync unzip util-linux wget xz-utils zstd
+
+      - name: Download official OpenWrt Snapshot Filogic ImageBuilder
+        run: |
+          mkdir -p /tmp/ib/extracted /tmp/ib/release
+          curl -fL --retry 3 -o /tmp/ib/ib.tar.zst \
+            https://downloads.openwrt.org/snapshots/targets/mediatek/filogic/openwrt-imagebuilder-mediatek-filogic.Linux-x86_64.tar.zst
+          curl -fsSL https://downloads.openwrt.org/snapshots/targets/mediatek/filogic/version.buildinfo \
+            -o /tmp/ib/version.buildinfo
+          tar --use-compress-program=unzstd -xf /tmp/ib/ib.tar.zst -C /tmp/ib/extracted --strip-components=1
+          rm -f /tmp/ib/ib.tar.zst
+
+      - name: Inject NRadio NBCPE board support
+        run: |
+          python3 -B board/inject_imagebuilder.py /tmp/ib/extracted
+
+      - name: Record the project release in the firmware
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_release
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG="$GITHUB_REF_NAME"
+          else
+            REV="$(tr -d ' \r\n' < /tmp/ib/version.buildinfo)"
+            TAG="openwrt-${REV}-$(date -u +%Y%m%d%H%M)"
+          fi
+          RELEASE_FILE=/tmp/ib/extracted/files-nbcpe/usr/share/nradio-nbcpe/release
+          install -d "$(dirname "$RELEASE_FILE")"
+          printf '%s\n' "$TAG" > "$RELEASE_FILE"
+          printf 'NRADIO_RELEASE_TAG=%s\n' "$TAG" >> "$GITHUB_ENV"
+
+      - name: Pack custom sysupgrade.bin
+        run: |
+          EXTRA_PKGS="${{ inputs.extra_packages }}"
+          if [ -z "$EXTRA_PKGS" ]; then
+            EXTRA_PKGS="luci luci-ssl luci-proto-ncm luci-i18n-base-zh-cn luci-i18n-firewall-zh-cn luci-i18n-package-manager-zh-cn iw-full usbutils picocom"
+          fi
+          umask 022
+          make -C /tmp/ib/extracted image \
+            PROFILE="nradio_nbcpe" \
+            PACKAGES="kmod-usb-net-cdc-ether ${EXTRA_PKGS}" \
+            FILES="files-nbcpe"
+
+      - name: Verify sysupgrade metadata and stage artifacts
+        run: |
+          BIN="/tmp/ib/extracted/bin/targets/mediatek/filogic/openwrt-mediatek-filogic-nradio_nbcpe-squashfs-sysupgrade.bin"
+          DTB=(/tmp/ib/extracted/build_dir/target-*/linux-mediatek_filogic/image-mt7981-nradio-nbcpe.dtb)
+          FACTORY_NVMEM="/soc/mmc@11230000/card@0/block/partitions/block-partition-factory"
+          test "$(fdtget "${DTB[0]}" "$FACTORY_NVMEM" partname)" = factory
+          fdtget "${DTB[0]}" "$FACTORY_NVMEM/nvmem-layout/eeprom@0" reg
+          test "$(fdtget "${DTB[0]}" /chosen bootargs | tr ' ' '\n' | grep ^root=)" = "root=PARTLABEL=rootfs_2nd"
+          /tmp/ib/extracted/staging_dir/host/bin/fwtool -i /tmp/ib/meta.json "$BIN"
+          python3 - <<'PY'
+          import json, struct, tarfile
+          with open("/tmp/ib/meta.json") as f:
+              meta = json.load(f)
+          assert meta["compat_version"] == "1.0", meta
+          assert set(meta["supported_devices"]) == {"nradio,nbcpe"}, meta["supported_devices"]
+          with tarfile.open("/tmp/ib/extracted/bin/targets/mediatek/filogic/openwrt-mediatek-filogic-nradio_nbcpe-squashfs-sysupgrade.bin", "r") as tf:
+              names = tf.getnames()
+              assert any(n.endswith("/CONTROL") for n in names) and any(n.endswith("/kernel") for n in names) and any(n.endswith("/root") for n in names), names
+              kernel = tf.extractfile("sysupgrade-nradio_nbcpe/kernel").read(8)
+              assert kernel[:4] == b"\xd0\x0d\xfe\xed", "kernel member must be a FIT image for kernel_2nd"
+              root = tf.extractfile("sysupgrade-nradio_nbcpe/root")
+              header = root.read(48)
+              assert header[:4] == b"hsqs", "rootfs_2nd rootdisk requires SquashFS"
+              bytes_used = struct.unpack_from("<Q", header, 40)[0]
+              assert 0 < bytes_used <= root.size
+              # fstools uses the superblock size, while both flashers use the tar member size.
+              assert (bytes_used + 65535) // 65536 == (root.size + 65535) // 65536
+          with open("/tmp/ib/extracted/bin/targets/mediatek/filogic/openwrt-mediatek-filogic-nradio_nbcpe.manifest") as mf:
+              # APK manifests use "pkgname-version"; legacy OPKG used "pkgname - version".
+              # The first whitespace token is the package name in both formats.
+              pkgs = {line.split()[0] for line in mf if line.strip()}
+          assert "kmod-tun" in pkgs, "Firmware is missing kmod-tun"
+          assert "kmod-mt7915e" in pkgs and "kmod-mt7981-firmware" in pkgs, "Firmware is missing MT7981 Wi-Fi drivers"
+          if "luci-i18n-base-zh-cn" in pkgs:
+              for app in sorted(p for p in pkgs if p.startswith("luci-app-")):
+                  i18n = f"luci-i18n-{app.removeprefix('luci-app-')}-zh-cn"
+                  if i18n not in pkgs:
+                      print(f"::warning::No Chinese translation package {i18n} for {app} (may not exist upstream for custom packages); skipping")
+          PY
+          if [[ -n "${NRADIO_RELEASE_TAG:-}" ]]; then
+            tar -xOf "$BIN" sysupgrade-nradio_nbcpe/root > /tmp/ib/root.squashfs
+            BUILT_TAG=$(/tmp/ib/extracted/staging_dir/host/bin/unsquashfs4 -cat \
+              /tmp/ib/root.squashfs usr/share/nradio-nbcpe/release)
+            test "$BUILT_TAG" = "$NRADIO_RELEASE_TAG"
+            rm /tmp/ib/root.squashfs
+          fi
+          cp -f /tmp/ib/extracted/bin/targets/mediatek/filogic/openwrt-mediatek-filogic-nradio_nbcpe* /tmp/ib/release/
+          cp -f /tmp/ib/extracted/bin/targets/mediatek/filogic/profiles.json /tmp/ib/release/
+          cp -f /tmp/ib/extracted/build_dir/target-*/linux-mediatek_filogic/image-mt7981-nradio-nbcpe.dtb /tmp/ib/release/
+          (
+            cd /tmp/ib/release
+            sha256sum \
+              openwrt-mediatek-filogic-nradio_nbcpe-squashfs-sysupgrade.bin \
+              openwrt-mediatek-filogic-nradio_nbcpe.manifest \
+              openwrt-mediatek-filogic-nradio_nbcpe.bom.cdx.json \
+              profiles.json \
+              image-mt7981-nradio-nbcpe.dtb > sha256sums
+          )
+          ls -lh /tmp/ib/release
+          cat /tmp/ib/release/sha256sums
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-nradio-nbcpe-${{ github.run_number }}
+          path: /tmp/ib/release/*
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REV="$(cat /tmp/ib/version.buildinfo | tr -d ' \r\n')"
+          KVER="$(basename /tmp/ib/extracted/build_dir/target-*/linux-mediatek_filogic/linux-* | sed 's/^linux-//')"
+          TAG="$NRADIO_RELEASE_TAG"
+          cat <<EOF > /tmp/ib/release_notes.md
+          ## OpenWrt Official Snapshot (\`${REV}\` / Linux \`${KVER}\`) — NRadio NBCPE (WT9111)
+
+          基于**官方 OpenWrt \`main\` Snapshot \`mediatek/filogic\` ImageBuilder** 自动构建，遵循社区开源主线标准（不使用任何闭源 Wi-Fi 驱动或第三方魔改内核分支）。
+
+          ### 核心特性
+          - **内核与在线软件源**：Linux \`${KVER}\`，内核 \`vermagic\` 与 \`downloads.openwrt.org\` 官方 \`mediatek/filogic\` Snapshot 完全一致，刷入后可直接执行 \`apk update && apk add <pkg>\` 在线安装官方全部 \`kmod-*\` 与软件包。
+          - **Wi-Fi 6 (\`MT7981\` 双频 DBDC)**：主线开源 \`mt76\`（\`kmod-mt7915e\` + \`kmod-mt7981-firmware\`），EEPROM 校准数据只读挂载自 eMMC \`factory\` 分区，默认 \`country=CN\`。
+          - **默认无线**：新安装启用 \`NRadio-NBCPE-2G\` 和 \`NRadio-NBCPE-5G\`，使用 WPA2/WPA3 混合加密，初始密码为 \`12345678\`。
+          - **5G 蜂窝 (\`MT5700M-CN\` \`3466:3301\`)**：内置 \`mt5700\` 守护服务（\`comgt-ncm\` + \`luci-proto-ncm\`），支持 USB 自动挂起抑制、\`cpe-pwr\` 冷断电自愈、热重启 USB 2.0 → USB 3.0 (\`5000M\`) 自动重训练、模组 NVRAM 异常自愈（自动恢复 \`TDCFG\` 网卡模式与 \`C5GOPTION\` 5G SA）、双 SIM 卡自动切换、四大运营商 APN 自动配置、\`fw4\` 防火墙域与单 \`/64\` IPv6 \`odhcpd\` \`ndp=relay\` 下发及状态灯同步。
+          - **内置 \`luci-app-nradio-nbcpe\` 中文管理页（本仓库自带，随固件预装）**：**网络 → 5G 蜂窝**——模组/SIM（卡槽切换、IMSI/ICCID、运营商与注册状态）、\`AT^HCSQ\` 信号质量（RSRP/SINR/RSRQ 分制式解码 + 信号条）、蜂窝连接 IPv4/IPv6、模组温度实时状态，并可在页面直接配置 SIM 卡槽/APN/USB3 重训练/NVRAM 自愈/巡检间隔；**系统 → 双系统切换**——Web 一键切换回原厂固件（\`boot_system\` 通过原厂 \`ubenv\` 工具写入 eMMC \`u-boot-env\`，写入前校验环境完整性，含确认弹窗、待重启警告与一键取消切回）；**系统 → 在线固件更新**——直连本仓库 GitHub Release 检查新版本（SHA-256 摘要来自 api.github.com）、下载校验后可选「保留配置 / 不保留配置」一键 sysupgrade，同时刷新 \`kernel_2nd\` 与 \`rootfs_2nd\`（支持跨内核版本在线升级，支持自定义下载加速前缀）。
+          - **有线与系统**：\`LAN ×3 = lan1-3\`（MT7531 交换机）、\`WAN = wan\`（MaxLinear GPY115 2.5G PHY）、\`zram-swap\`（1 GB DDR3 下 50% 自适应压缩交换）、eMMC 第二系统启动保护（GPT 布局与 squashfs 根校验不符即进 failsafe，绝不写入原厂分区）。
+
+          ### 刷入、SSH 登录与双系统切换说明
+          - **首次安装**：在原厂 Web（\`192.168.10.1\`）「Backup / Flash Firmware → Flash second system」上传本 \`sysupgrade.bin\`（未签名 \`ustar\` \`compat_version 1.0\`，写入 eMMC \`kernel_2nd\` + \`rootfs_2nd\`，原厂系统分区不受影响），烧录完成后点击 **Switch system** 切换到第二系统启动。
+          - **默认管理地址**：\`http://192.168.1.1\`（首次登录 \`root\` 无密码，请立即设置密码）。净刷后 Dropbear 允许空密码 \`root\` SSH 首登；若提示密钥变更，先执行 \`ssh-keygen -R 192.168.1.1\`。
+          - **双系统无损切回原厂**：在 LuCI「系统 → 双系统切换」一键切换（\`boot_system=0\`），或在 OpenWrt SSH 执行 \`nbcpe-bootswitch to-factory && reboot\`；原厂 Web 的 **Switch system** 可随时再切回 OpenWrt。
+          - **在线升级**：同版本或跨内核版本均可通过「在线固件更新」完成（升级只作用于 eMMC 第二系统分区，原厂系统与 factory/bdinfo 校准数据永不触碰）。
+
+          ### SHA-256 校验值
+          \`\`\`text
+          $(cat /tmp/ib/release/sha256sums)
+          \`\`\`
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" /tmp/ib/release/* --clobber
+            gh release edit "$TAG" \
+              --title "OpenWrt Snapshot ${REV} (Linux ${KVER}) for NRadio NBCPE (WT9111)" \
+              --notes-file /tmp/ib/release_notes.md
+          else
+            gh release create "$TAG" /tmp/ib/release/* \
+              --title "OpenWrt Snapshot ${REV} (Linux ${KVER}) for NRadio NBCPE (WT9111)" \
+              --notes-file /tmp/ib/release_notes.md
+          fi

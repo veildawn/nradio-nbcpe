@@ -1,0 +1,1018 @@
+#!/bin/sh
+# NRadio NBCPE onboard TD Tech / Huawei MT5700M-CN (3466:3301) manager.
+# Handles:
+#   - Modem power GPIO (cpe-pwr) & hardware cold power-cycle self-rescue
+#   - Deterministic sysfs PCUI AT port (bInterfaceProtocol=12), netdev & USB autosuspend guard
+#   - Warm-reboot USB 2.0 (480M) -> USB 3.0 (5000M) one-shot retrain
+#   - Cross-ROM NVRAM self-heal (USB Stick mode TDCFG=1, Linux NCM SETMODE, 5G SA+NSA C5GOPTION)
+#   - 2-slot SIM routing (External SIM1 / SIM2, modem-internal AT^SCICHG; boards
+#     that export a cpe-sel0 GPIO mux keep the hardware route as well)
+#   - IMSI -> carrier APN auto-provisioning & netifd wwan health supervision
+#   - AT^CHIPTEMP? thermal guard (boosts PWM fan when present) well before 97 C CFUN cutoff
+#   - Per-tick read-only AT status stamp for LuCI (/usr/sbin/mt5700-status)
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+
+[ "$(board_name)" = "nradio,nbcpe" ] || exit 0
+
+LOCKFILE="/var/lock/mt5700.lock"
+PIDFILE="/var/lock/mt5700.pid"
+USB3_STAMP="/tmp/mt5700.usb3_tried"
+NVRAM_STAMP="/tmp/mt5700.nvram_checked"
+PWR_RESCUE_STAMP="/tmp/mt5700.pwr_rescue"
+SLOT_STAMP="/tmp/mt5700.active_slot"
+TEMP_STAMP="/tmp/mt5700.chip_temp"
+STATUS_RAW_STAMP="/tmp/mt5700.status.raw"
+FAN_BOOST_STAMP="/tmp/mt5700.fan_boost"
+THERM_TICK_STAMP="/tmp/mt5700.therm_tick"
+
+MODEM_USBDEV=""
+MODEM_SPEED=""
+MODEM_AT=""
+MODEM_NET=""
+STATUS_THERMAL=""
+
+log() {
+	logger -t mt5700 "$*"
+}
+
+gpio_set() {
+	local name="$1" val="$2"
+	[ -w "/sys/class/gpio/$name/value" ] && echo "$val" > "/sys/class/gpio/$name/value" 2>/dev/null
+}
+
+gpio_get() {
+	local name="$1"
+	cat "/sys/class/gpio/$name/value" 2>/dev/null | tr -d ' \r\n'
+}
+
+at_cmd() {
+	local port="$1" cmd="$2"
+	[ -c "$port" ] || return 1
+	COMMAND="$cmd" gcom -d "$port" -s /etc/gcom/mt5700-at.gcom 2>/dev/null | tr -d '\r'
+}
+
+apn_from_imsi() {
+	case "$1" in
+	46000*|46002*|46004*|46007*|46008*|46013*|46024*) echo "cmnet" ;;
+	46001*|46006*|46009*|46010*) echo "3gnet" ;;
+	46003*|46005*|46011*|46012*) echo "ctnet" ;;
+	46015*) echo "cbnet" ;;
+	*) echo "" ;;
+	esac
+}
+
+modem_usb_present() {
+	local d vid pid
+	for d in /sys/bus/usb/devices/*; do
+		[ -f "$d/idVendor" ] && [ -f "$d/idProduct" ] || continue
+		vid=$(cat "$d/idVendor" 2>/dev/null)
+		pid=$(cat "$d/idProduct" 2>/dev/null)
+		if [ "$vid" = "3466" ] && [ "$pid" = "3301" ]; then
+			cat "$d/speed" 2>/dev/null | tr -d ' \r\n'
+			return 0
+		fi
+	done
+	return 1
+}
+
+discover_modem() {
+	MODEM_USBDEV=""
+	MODEM_SPEED=""
+	MODEM_AT=""
+	MODEM_NET=""
+
+	local d vid pid ifdir proto tty_name n probe_out
+	for d in /sys/bus/usb/devices/*; do
+		[ -f "$d/idVendor" ] && [ -f "$d/idProduct" ] || continue
+		vid=$(cat "$d/idVendor" 2>/dev/null)
+		pid=$(cat "$d/idProduct" 2>/dev/null)
+		[ "$vid" = "3466" ] && [ "$pid" = "3301" ] || continue
+
+		# Prevent Linux USB autosuspend from powering down MT5700M USB PHY
+		[ -w "$d/power/control" ] && echo on > "$d/power/control" 2>/dev/null
+
+		MODEM_USBDEV="$d"
+		MODEM_SPEED=$(cat "$d/speed" 2>/dev/null | tr -d ' \r\n')
+
+		# Discover network interface (cdc_ether / cdc_ncm / huawei_cdc_ncm / rndis)
+		for n in "$d":*/net/*; do
+			if [ -d "$n" ]; then
+				MODEM_NET=$(basename "$n")
+				break
+			fi
+		done
+
+		# Discover PCUI AT port (bInterfaceProtocol == 12 per TD Tech USB spec)
+		for ifdir in "$d":*; do
+			[ -d "$ifdir" ] || continue
+			proto=$(cat "$ifdir/bInterfaceProtocol" 2>/dev/null)
+			if [ "$proto" = "12" ]; then
+				for n in "$ifdir"/ttyUSB* "$ifdir"/tty/ttyUSB*; do
+					if [ -d "$n" ]; then
+						tty_name=$(basename "$n")
+						[ -c "/dev/$tty_name" ] && MODEM_AT="/dev/$tty_name"
+						break
+					fi
+				done
+				[ -n "$MODEM_AT" ] && break
+			fi
+		done
+
+		# Fallback 1: match interface description "PCUI"
+		if [ -z "$MODEM_AT" ]; then
+			for ifdir in "$d":*; do
+				[ -d "$ifdir" ] || continue
+				if grep -qi "pcui" "$ifdir/interface" 2>/dev/null; then
+					for n in "$ifdir"/ttyUSB* "$ifdir"/tty/ttyUSB*; do
+						if [ -d "$n" ]; then
+							tty_name=$(basename "$n")
+							[ -c "/dev/$tty_name" ] && MODEM_AT="/dev/$tty_name"
+							break
+						fi
+					done
+				fi
+				[ -n "$MODEM_AT" ] && break
+			done
+		fi
+
+		# Fallback 2: actively probe modem ttyUSB* ports for AT -> OK
+		if [ -z "$MODEM_AT" ]; then
+			for ifdir in "$d":*; do
+				[ -d "$ifdir" ] || continue
+				for n in "$ifdir"/ttyUSB* "$ifdir"/tty/ttyUSB*; do
+					[ -d "$n" ] || continue
+					tty_name=$(basename "$n")
+					[ -c "/dev/$tty_name" ] || continue
+					probe_out=$(at_cmd "/dev/$tty_name" "AT")
+					case "$probe_out" in
+					*OK*)
+						MODEM_AT="/dev/$tty_name"
+						break
+						;;
+					esac
+				done
+				[ -n "$MODEM_AT" ] && break
+			done
+		fi
+
+		if [ -z "$MODEM_AT" ] && [ -c /dev/ttyUSB1 ]; then
+			MODEM_AT="/dev/ttyUSB1"
+		fi
+
+		[ -n "$MODEM_AT" ] && return 0
+	done
+
+	return 1
+}
+
+wait_for_modem() {
+	local max_wait="${1:-40}" i=0
+	while [ "$i" -lt "$max_wait" ]; do
+		discover_modem && return 0
+		sleep 1
+		i=$((i + 1))
+	done
+	return 1
+}
+
+# Hardware cold power-cycle per MT5700M-CN Hardware Design Guide Table 4-6:
+# VBAT off hold >= 2s (3s used), USB ready ~22s (45s max wait).
+cold_power_cycle_modem() {
+	local reason="$1" tries
+	tries=$(cat "$PWR_RESCUE_STAMP" 2>/dev/null | tr -cd '0-9')
+	[ -n "$tries" ] || tries=0
+	if [ "$tries" -ge 2 ]; then
+		log "Cold power-cycle rescue cap ($tries/2) reached ($reason)"
+		return 1
+	fi
+	tries=$((tries + 1))
+	echo "$tries" > "$PWR_RESCUE_STAMP"
+	log "Cold power-cycling MT5700M-CN ($tries/2: $reason)"
+	ifdown wwan >/dev/null 2>&1
+	gpio_set cpe-pwr 0
+	sleep 3
+	gpio_set cpe-pwr 1
+	sleep 5
+	if wait_for_modem 45; then
+		log "MT5700M-CN recovered after cold power-cycle (${MODEM_SPEED:-?} Mbps, AT=$MODEM_AT NET=${MODEM_NET:-none})"
+		return 0
+	fi
+	log "MT5700M-CN did not enumerate after cold power-cycle ($tries/2)"
+	return 1
+}
+
+ensure_usb3() {
+	local usb3_retrain="$1" i=0 cur_spd=""
+	[ "$usb3_retrain" = "1" ] || return 0
+	[ "$MODEM_SPEED" = "480" ] || return 0
+	[ ! -f "$USB3_STAMP" ] || return 0
+
+	touch "$USB3_STAMP"
+	log "MT5700M enumerated at 480 Mbps (USB 2.0); issuing one-time AT+CFUN=1,1 for USB 3.0 5000 Mbps"
+	ifdown wwan >/dev/null 2>&1
+	at_cmd "$MODEM_AT" "AT+CFUN=1,1" >/dev/null
+
+	# Wait up to 25s for the USB 2.0 device to disconnect (or already switch speed)
+	while [ "$i" -lt 25 ]; do
+		if ! cur_spd=$(modem_usb_present); then
+			break
+		fi
+		[ "$cur_spd" != "480" ] && break
+		sleep 1
+		i=$((i + 1))
+	done
+
+	if wait_for_modem 60; then
+		log "MT5700M re-enumerated at ${MODEM_SPEED:-unknown} Mbps (AT=$MODEM_AT NET=${MODEM_NET:-none})"
+		return 0
+	fi
+
+	cold_power_cycle_modem "AT+CFUN=1,1 USB3 retrain timeout"
+}
+
+# Self-heal persistent modem NVRAM states that may have been altered by previous ROMs:
+#   - AT^SETMODE: modes 6/7/8 lack Linux CDC-NCM/ECM (keep 1 Factory & 4 Linux NCM untouched)
+#   - AT^TDCFG: Mode 2 (E5 NAT) or Mode 3 (Factory IP-passthrough) breaks Stick AT^NDISDUP=1,1
+#   - AT^C5GOPTION: ensure 1,1,1 (5G SA + NSA Option 2+3) if previously locked to NSA-only
+ensure_modem_nvram() {
+	local fix_nvram="$1" setmode_raw setmode td_mode c5g need_reset=0 i=0
+	[ "$fix_nvram" = "1" ] || return 0
+	[ ! -f "$NVRAM_STAMP" ] || return 0
+
+	setmode_raw=$(at_cmd "$MODEM_AT" "AT^SETMODE?")
+	setmode=$(echo "$setmode_raw" | sed -n 's/^.*^SETMODE:[[:space:]]*\([0-9][0-9]*\).*$/\1/p; s/^[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$/\1/p' | head -n 1)
+	case "$setmode" in
+	6|7|8)
+		log "Restoring MT5700M Linux NCM USB profile AT^SETMODE=4 (was $setmode)"
+		ifdown wwan >/dev/null 2>&1
+		at_cmd "$MODEM_AT" "AT^SETMODE=4" >/dev/null
+		sleep 5
+		if ! wait_for_modem 60; then
+			cold_power_cycle_modem "AT^SETMODE=4 re-enumeration timeout" || return 1
+		fi
+		;;
+	esac
+
+	td_mode=$(at_cmd "$MODEM_AT" "AT^TDCFG?" | sed -n 's/^[[:space:]]*Mode[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*$/\1/p' | head -n 1)
+	if [ -n "$td_mode" ] && [ "$td_mode" != "1" ]; then
+		log "Restoring MT5700M USB Stick mode TDCFG=1 (was Mode=$td_mode)"
+		at_cmd "$MODEM_AT" 'AT^TDCFG="infcfg","mode",1' >/dev/null
+		at_cmd "$MODEM_AT" "AT^SETE5STICK=0" >/dev/null
+		need_reset=1
+	fi
+
+	c5g=$(at_cmd "$MODEM_AT" "AT^C5GOPTION?" | sed -n 's/^.*^C5GOPTION:[[:space:]]*\([0-9],[0-9],[0-9]\).*$/\1/p' | head -n 1)
+	if [ -n "$c5g" ] && [ "$c5g" != "1,1,1" ]; then
+		log "Restoring MT5700M 5G SA+NSA access option C5GOPTION=1,1,1 (was $c5g)"
+		at_cmd "$MODEM_AT" "AT+CFUN=0" >/dev/null
+		sleep 2
+		at_cmd "$MODEM_AT" "AT^C5GOPTION=1,1,1" >/dev/null
+		need_reset=1
+	fi
+
+	touch "$NVRAM_STAMP"
+
+	if [ "$need_reset" = "1" ]; then
+		ifdown wwan >/dev/null 2>&1
+		at_cmd "$MODEM_AT" "AT+CFUN=1,1" >/dev/null
+		while [ "$i" -lt 20 ]; do
+			modem_usb_present >/dev/null || break
+			sleep 1
+			i=$((i + 1))
+		done
+		if ! wait_for_modem 60; then
+			cold_power_cycle_modem "NVRAM self-heal reset timeout" || return 1
+		fi
+	fi
+
+	return 0
+}
+
+cpu_target_pwm() {
+	local t
+	t=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null | tr -cd '0-9-')
+	case "$t" in
+	""|-*) echo 0; return ;;
+	esac
+	if [ "$t" -ge 85000 ]; then
+		echo 255
+	elif [ "$t" -ge 75000 ]; then
+		echo 150
+	elif [ "$t" -ge 65000 ]; then
+		echo 80
+	else
+		echo 0
+	fi
+}
+
+# Monitor MT5700M-CN 12 internal sensors (AT^CHIPTEMP?, 0.1 C units, 65535 = error)
+# and boost PWM fan >= 72 C so the modem stays well below its 97 C CFUN=0/1 cutoff.
+check_modem_thermal() {
+	local thermal_guard="$1" raw vals old_ifs v max_deci=-1000 valid=0
+	local hwmon pwm_file en_file modem_pwm cpu_pwm target_pwm prev_boost
+
+	[ "$thermal_guard" = "1" ] || return 0
+	[ -c "$MODEM_AT" ] || return 0
+
+	# Reuse this tick's sweep; only query again if no temperature arrived.
+	raw="$STATUS_THERMAL"
+	[ -n "$raw" ] || raw=$(at_cmd "$MODEM_AT" "AT^CHIPTEMP?" | tr '\n' ' ')
+	vals=$(echo "$raw" | sed -n 's/^.*^CHIPTEMP:[[:space:]]*\([-0-9,[:space:]]*\).*$/\1/p' | tr -d ' ')
+	[ -n "$vals" ] || return 0
+
+	old_ifs="$IFS"
+	IFS=','
+	for v in $vals; do
+		case "$v" in
+		""|65535|*[!0-9-]*) continue ;;
+		esac
+		if [ "$v" -ge -400 ] 2>/dev/null && [ "$v" -le 1250 ] 2>/dev/null; then
+			valid=1
+			[ "$v" -gt "$max_deci" ] && max_deci="$v"
+		fi
+	done
+	IFS="$old_ifs"
+
+	[ "$valid" = "1" ] || return 0
+	echo "$max_deci" > "$TEMP_STAMP"
+
+	hwmon=$(ls -d /sys/devices/platform/pwm-fan/hwmon/hwmon* 2>/dev/null | head -n 1)
+	[ -n "$hwmon" ] || return 0
+	pwm_file="$hwmon/pwm1"
+	en_file="$hwmon/pwm1_enable"
+	[ -w "$pwm_file" ] && [ -w "$en_file" ] || return 0
+
+	if [ "$max_deci" -ge 820 ]; then
+		modem_pwm=255
+	elif [ "$max_deci" -ge 770 ]; then
+		modem_pwm=150
+	elif [ "$max_deci" -ge 720 ]; then
+		modem_pwm=80
+	else
+		modem_pwm=0
+	fi
+
+	if [ "$modem_pwm" -gt 0 ]; then
+		cpu_pwm=$(cpu_target_pwm)
+		target_pwm="$modem_pwm"
+		[ "$cpu_pwm" -gt "$target_pwm" ] && target_pwm="$cpu_pwm"
+		prev_boost=$(cat "$FAN_BOOST_STAMP" 2>/dev/null | tr -cd '0-9')
+		echo 1 > "$en_file" 2>/dev/null
+		echo "$target_pwm" > "$pwm_file" 2>/dev/null
+		if [ "$prev_boost" != "$target_pwm" ]; then
+			echo "$target_pwm" > "$FAN_BOOST_STAMP"
+			log "MT5700M temp $((max_deci / 10)).$((max_deci % 10)) C -> boosting fan PWM to $target_pwm/255"
+		fi
+	elif [ -f "$FAN_BOOST_STAMP" ] && [ "$max_deci" -le 670 ]; then
+		cpu_pwm=$(cpu_target_pwm)
+		echo "$cpu_pwm" > "$pwm_file" 2>/dev/null
+		echo 2 > "$en_file" 2>/dev/null
+		rm -f "$FAN_BOOST_STAMP"
+		log "MT5700M cooled to $((max_deci / 10)).$((max_deci % 10)) C -> restored automatic CPU thermal fan control"
+	fi
+}
+
+check_sim_ready() {
+	local tries="${1:-4}" i=0 out
+	while [ "$i" -lt "$tries" ]; do
+		out=$(at_cmd "$MODEM_AT" "AT+CPIN?")
+		case "$out" in
+		*"+CPIN: READY"*|*"+CPIN: SIM PIN"*|*"+CPIN: SIM PUK"*)
+			return 0
+			;;
+		esac
+		sleep 2
+		i=$((i + 1))
+	done
+	return 1
+}
+
+switch_sim_slot() {
+	local slot="$1" sel_gpio scichg cur_gpio cur_scichg
+	case "$slot" in
+	sim1)
+		sel_gpio="0"
+		scichg="1,0"
+		;;
+	sim2)
+		sel_gpio="1"
+		scichg="0,1"
+		;;
+	esim)
+		sel_gpio="1"
+		scichg="1,0"
+		;;
+	*)
+		return 1
+		;;
+	esac
+
+	cur_gpio=$(gpio_get cpe-sel0)
+	cur_scichg=$(at_cmd "$MODEM_AT" "AT^SCICHG?" | sed -n 's/^.*^SCICHG:[[:space:]]*\([0-9],[0-9]\).*$/\1/p' | head -n 1)
+
+	# NBCPE (WT9111) has no cpe-sel0 GPIO export: SIM routing is modem-internal
+	# (AT^SCICHG only). Skip the GPIO compare/set whenever the export is absent.
+	if [ -z "$cur_gpio" ] && [ ! -e /sys/class/gpio/cpe-sel0 ]; then
+		sel_gpio=""
+		[ "$cur_scichg" = "$scichg" ] && {
+			echo "$slot" > "$SLOT_STAMP"
+			return 0
+		}
+	elif [ "$cur_gpio" = "$sel_gpio" ] && [ "$cur_scichg" = "$scichg" ]; then
+		echo "$slot" > "$SLOT_STAMP"
+		return 0
+	fi
+
+	# Invalidate the LuCI status stamp first: from this moment any previously
+	# captured SIM/signal data belongs to the old slot and must not be shown.
+	rm -f "$STATUS_RAW_STAMP"
+
+	log "Switching SIM route to $slot (SCICHG=$scichg)"
+	[ -n "$sel_gpio" ] && gpio_set cpe-sel0 "$sel_gpio"
+	at_cmd "$MODEM_AT" "AT^SCICHG=$scichg" >/dev/null
+	at_cmd "$MODEM_AT" "AT^HVSST=1,0" >/dev/null
+	sleep 2
+	at_cmd "$MODEM_AT" "AT^HVSST=1,1" >/dev/null
+	at_cmd "$MODEM_AT" "AT+CFUN=0" >/dev/null
+	sleep 2
+	at_cmd "$MODEM_AT" "AT+CFUN=1" >/dev/null
+	echo "$slot" > "$SLOT_STAMP"
+	sleep 2
+	return 0
+}
+
+ensure_sim() {
+	local sim_slot="$1" cfun s
+
+	cfun=$(at_cmd "$MODEM_AT" "AT+CFUN?")
+	case "$cfun" in
+	*"+CFUN: 0"*)
+		at_cmd "$MODEM_AT" "AT+CFUN=1" >/dev/null
+		sleep 2
+		;;
+	esac
+
+	case "$sim_slot" in
+	sim1|sim2|esim)
+		switch_sim_slot "$sim_slot"
+		check_sim_ready 5 && return 0
+		log "Configured SIM slot $sim_slot has no ready SIM"
+		return 1
+		;;
+	*)
+		# Fast path: keep current slot if SIM is already ready
+		if check_sim_ready 3; then
+			if [ ! -s "$SLOT_STAMP" ]; then
+				local fg fsc
+				fg=$(gpio_get cpe-sel0)
+				fsc=$(at_cmd "$MODEM_AT" "AT^SCICHG?" | sed -n 's/^.*^SCICHG:[[:space:]]*\([0-9],[0-9]\).*$/\1/p' | head -n 1)
+				if [ -z "$fg" ] && [ ! -e /sys/class/gpio/cpe-sel0 ]; then
+					# No GPIO mux on this board: derive the active slot from SCICHG
+					case "$fsc" in
+					0,1) echo "sim2" > "$SLOT_STAMP" ;;
+					*) echo "sim1" > "$SLOT_STAMP" ;;
+					esac
+				elif [ "$fg" = "1" ] && [ "$fsc" = "0,1" ]; then
+					echo "sim2" > "$SLOT_STAMP"
+				elif [ "$fg" = "1" ]; then
+					echo "esim" > "$SLOT_STAMP"
+				else
+					echo "sim1" > "$SLOT_STAMP"
+				fi
+			fi
+			return 0
+		fi
+		# Auto-probe External SIM1 -> External SIM2 -> Built-in eSIM
+		for s in sim1 sim2 esim; do
+			switch_sim_slot "$s"
+			if check_sim_ready 5; then
+				log "Detected active SIM on $s"
+				return 0
+			fi
+		done
+		# Default back to External SIM1 when no card is inserted
+		switch_sim_slot sim1
+		log "No SIM card detected across sim1/sim2/esim"
+		return 1
+		;;
+	esac
+}
+
+set_cellular_leds() {
+	local led5="/sys/class/leds/blue:indicator-0/brightness"
+	local led4="/sys/class/leds/blue:indicator-1/brightness"
+	[ -w "$led5" ] && echo "$1" > "$led5" 2>/dev/null
+	[ -w "$led4" ] && echo "$2" > "$led4" 2>/dev/null
+}
+
+refresh_cellular_leds() {
+	local reg5 reg4
+	reg5=$(at_cmd "$MODEM_AT" "AT+C5GREG?")
+	case "$reg5" in
+	*",1"*|*",5"*)
+		set_cellular_leds 1 0
+		return 0
+		;;
+	esac
+	reg4=$(at_cmd "$MODEM_AT" "AT+CEREG?")
+	case "$reg4" in
+	*",1"*|*",5"*)
+		set_cellular_leds 0 1
+		return 0
+		;;
+	esac
+	set_cellular_leds 0 0
+	return 1
+}
+
+wait_registration() {
+	local i=0
+	while [ "$i" -lt 15 ]; do
+		refresh_cellular_leds && return 0
+		sleep 2
+		i=$((i + 1))
+	done
+	return 1
+}
+
+wwan_has_ip() {
+	local st4 st6
+	st4=$(ubus call network.interface.wwan_4 status 2>/dev/null)
+	echo "$st4" | grep -q '"address":' && return 0
+	st6=$(ubus call network.interface.wwan_6 status 2>/dev/null)
+	echo "$st6" | grep -q '"address":' && return 0
+	return 1
+}
+
+wwan_is_pending() {
+	ubus call network.interface.wwan status 2>/dev/null | grep -q '"pending":[[:space:]]*true'
+}
+
+# Refresh the raw AT status stamp consumed by /usr/sbin/mt5700-status (LuCI).
+# Runs under the daemon lock early in each tick so the web UI gets fresh data
+# without ever contending for the PCUI port; skipped while ncm.sh is dialing.
+refresh_status_raw() {
+	local out
+	STATUS_THERMAL=""
+	[ -c "$MODEM_AT" ] || return 1
+	wwan_is_pending && return 1
+	# "^" AT commands must ride env vars: gcom script literals eat ^X as control escapes
+	out=$(CMD_ICCID='AT^ICCID?' CMD_HCSQ='AT^HCSQ?' CMD_SCICHG='AT^SCICHG?' CMD_CHIPTEMP='AT^CHIPTEMP?' \
+		CMD_MONSC='AT^MONSC' CMD_NDIS='AT^NDISSTATQRY?' CMD_CFG='AT^SYSCFGEX?' CMD_NWTIME='AT^NWTIME?' \
+		CMD_DSAMBR='AT^DSAMBR=1' \
+		timeout 40 gcom -d "$MODEM_AT" -s /etc/gcom/mt5700-status.gcom 2>/dev/null | tr -d '\r') || true
+	case "$out" in
+	*OK*)
+		printf '%s\n' "$out" > "$STATUS_RAW_STAMP.$$" && mv -f "$STATUS_RAW_STAMP.$$" "$STATUS_RAW_STAMP"
+		STATUS_THERMAL=$(printf '%s\n' "$out" | sed -n '/^\^CHIPTEMP:/p' | tail -n 1)
+		;;
+	*) return 1 ;;
+	esac
+}
+
+# Persistent traffic accounting (day / billing-period / total buckets) fed
+# from the modem netdev kernel counters; survives reboots in
+# /etc/mt5700/traffic.db. The monthly bucket follows a configurable billing
+# anchor day (uci mt5700.modem.traffic_reset_day): the period containing date
+# D runs from anchor-day in D's month (or the previous month when D is before
+# the anchor) up to the day before the next anchor.
+TRAFFIC_DB="/etc/mt5700/traffic.db"
+
+traffic_reset_day() {
+	local rd
+	rd=$(uci -q get mt5700.modem.traffic_reset_day | tr -cd '0-9')
+	case "$rd" in
+	""|0) echo 1 ;;
+	*) [ "$rd" -ge 1 ] && [ "$rd" -le 31 ] && echo "$rd" || echo 1 ;;
+	esac
+}
+
+traffic_days_in_month() {
+	# $1=YYYY $2=MM -> last day (Gregorian leap rules)
+	local y=$1 m=$2
+	case "$m" in
+	01|03|05|07|08|10|12) echo 31 ;;
+	04|06|09|11) echo 30 ;;
+	02)
+		if [ $((y % 4)) -eq 0 ] && { [ $((y % 100)) -ne 0 ] || [ $((y % 400)) -eq 0 ]; }; then
+			echo 29
+		else
+			echo 28
+		fi
+		;;
+	esac
+}
+
+traffic_period_key() {
+	# prints "<anchorY>-<anchorM>:<rd>" for the billing period containing today
+	local rd y m d ldm anchor_d ay am
+	rd=$(traffic_reset_day)
+	y=$(date +%Y); m=$(date +%m); d=$(date +%d)
+	ldm=$(traffic_days_in_month "$y" "$m")
+	# effective anchor day when the month is shorter than the configured day
+	[ "$rd" -le "$ldm" ] && anchor_d=$rd || anchor_d=$ldm
+	if [ "${d#0}" -ge "$anchor_d" ]; then
+		echo "$y-$m:$rd"
+	else
+		case "$m" in
+		01) ay=$((y - 1)); am=12 ;;
+		*)  ay=$y; am=$(printf '%02d' $(( ${m#0} - 1 ))) ;;
+		esac
+		echo "$ay-$am:$rd"
+	fi
+}
+
+record_traffic() {
+	local net="$MODEM_NET" rx tx now day mon
+	local day_rx day_tx mon_rx mon_tx tot_rx tot_tx last_rx last_tx
+	[ -n "$net" ] && [ -d "/sys/class/net/$net/statistics" ] || return 0
+	rx=$(cat "/sys/class/net/$net/statistics/rx_bytes" 2>/dev/null | tr -cd '0-9')
+	tx=$(cat "/sys/class/net/$net/statistics/tx_bytes" 2>/dev/null | tr -cd '0-9')
+	[ -n "$rx" ] && [ -n "$tx" ] || return 0
+	now=$(date +%s)
+	day=$(date +%Y-%m-%d)
+	mon=$(traffic_period_key)
+
+	# volatile working copy; checkpoints to NOR at most every 10 minutes
+	# (or after 1 MiB of new traffic) to spare the rootfs_data overlay
+	local vdb=/tmp/mt5700.traffic.db
+	[ -f "$vdb" ] || cp "$TRAFFIC_DB" "$vdb" 2>/dev/null
+	if [ -f "$vdb" ]; then
+		eval "$(sed -n 's/^\([a-z_]*\)=\([^ ]*\)$/\1="\2"/p' "$vdb")"
+	fi
+	day_rx=${day_rx:-0}; day_tx=${day_tx:-0}
+	mon_rx=${mon_rx:-0}; mon_tx=${mon_tx:-0}
+	tot_rx=${tot_rx:-0}; tot_tx=${tot_tx:-0}
+	old_day=${day_key:-$day}
+	old_mon=${mon_key:-$mon}
+
+	# first sighting (fresh db / cleared totals): adopt current counters as
+	# the baseline without crediting historic session bytes to any bucket
+	if [ -z "${last_rx:-}" ] || [ -z "${last_tx:-}" ]; then
+		last_rx=$rx; last_tx=$tx
+	fi
+
+	# calendar / billing-period rollovers zero their buckets regardless of
+	# whether the counters are monotonic across the boundary
+	[ "$old_day" != "$day" ] && { day_rx=0; day_tx=0; }
+	[ "$old_mon" != "$mon" ] && { mon_rx=0; mon_tx=0; }
+
+	# deltas vs last sample; counter reset / iface rebuild -> resync only
+	if [ "$rx" -ge "${last_rx:-0}" ] && [ "$tx" -ge "${last_tx:-0}" ]; then
+		local drx=$((rx - last_rx)) dtx=$((tx - last_tx))
+		day_rx=$((day_rx + drx)); day_tx=$((day_tx + dtx))
+		mon_rx=$((mon_rx + drx)); mon_tx=$((mon_tx + dtx))
+		tot_rx=$((tot_rx + drx)); tot_tx=$((tot_tx + dtx))
+	fi
+	last_rx=$rx; last_tx=$tx
+
+	printf 'day_key=%s\nmon_key=%s\nday_rx=%d\nday_tx=%d\nmon_rx=%d\nmon_tx=%d\ntot_rx=%d\ntot_tx=%d\nlast_rx=%s\nlast_tx=%s\nupdated=%s\n' \
+		"$day" "$mon" "$day_rx" "$day_tx" "$mon_rx" "$mon_tx" "$tot_rx" "$tot_tx" "$rx" "$tx" "$now" > "$vdb"
+
+	# checkpoint policy: every 600s or after 1 MiB of new traffic
+	local ckpt_at="" ckpt_tot=0
+	if [ -f "$TRAFFIC_DB" ]; then
+		ckpt_at=$(sed -n 's/^updated=//p' "$TRAFFIC_DB" | tail -n 1)
+		ckpt_tot=$(( $(sed -n 's/^tot_rx=//p' "$TRAFFIC_DB" | tail -n 1) + $(sed -n 's/^tot_tx=//p' "$TRAFFIC_DB" | tail -n 1) ))
+	fi
+	if [ -z "$ckpt_at" ] || [ $((now - ckpt_at)) -ge 600 ] || [ $((tot_rx + tot_tx - ckpt_tot)) -ge 1048576 ]; then
+		mkdir -p /etc/mt5700
+		cp "$vdb" "$TRAFFIC_DB"
+	fi
+}
+
+# Per-connection session baseline: when wwan_4 uptime drops, the data
+# connection restarted -- rebase "session traffic" to the current one.
+record_session_baseline() {
+	local net="$MODEM_NET" up rx tx prev_up=999999999
+	[ -n "$net" ] || return 0
+	up=$(ubus call network.interface.wwan_4 status 2>/dev/null | jsonfilter -e '@.uptime' 2>/dev/null)
+	[ -n "$up" ] || return 0
+	rx=$(cat "/sys/class/net/$net/statistics/rx_bytes" 2>/dev/null | tr -cd '0-9')
+	tx=$(cat "/sys/class/net/$net/statistics/tx_bytes" 2>/dev/null | tr -cd '0-9')
+	local f=/tmp/mt5700.session
+	[ -f "$f" ] && prev_up=$(sed -n 's/^uptime=//p' "$f")
+	if [ ! -f "$f" ] || [ "$up" -lt "$prev_up" ]; then
+		printf 'uptime=%s\nbase_rx=%s\nbase_tx=%s\n' "$up" "${rx:-0}" "${tx:-0}" > "$f"
+	else
+		sed -i "s/^uptime=.*/uptime=$up/" "$f"
+	fi
+}
+
+# Returns 0 when a configured monthly limit is exceeded (billing-period
+# bucket). Enforcement ('offline') tears the session down and gates dialing;
+# 'notify' only reports through mt5700-status for the LuCI badge.
+traffic_over_limit() {
+	local limit_mb action used
+	limit_mb=$(uci -q get mt5700.modem.traffic_limit_mb | tr -cd '0-9')
+	[ -n "$limit_mb" ] || return 1
+	[ "$limit_mb" -gt 0 ] || return 1
+	local qdb=/tmp/mt5700.traffic.db
+	[ -f "$qdb" ] || qdb="$TRAFFIC_DB"
+	[ -f "$qdb" ] || return 1
+	local mon_rx=0 mon_tx=0
+	eval "$(sed -n 's/^\(mon_rx\|mon_tx\)=\([0-9]*\)$/\1=\2/p' "$qdb")"
+	used=$(( (mon_rx + mon_tx) / 1048576 ))
+	[ "$used" -ge "$limit_mb" ] || return 1
+	action=$(uci -q get mt5700.modem.traffic_action)
+	[ "$action" = "offline" ] || return 2
+	return 0
+}
+
+# Honor the UI "clear traffic statistics" marker: wipe the requested bucket
+# range and drop the marker so it only acts once.
+apply_traffic_reset() {
+	local marker
+	marker=$(uci -q get mt5700.modem.traffic_reset)
+	[ -n "$marker" ] || return 0
+	uci -q delete mt5700.modem.traffic_reset
+	uci commit mt5700
+	local vdb=/tmp/mt5700.traffic.db
+	for f in "$TRAFFIC_DB" "$vdb"; do
+		[ -f "$f" ] || continue
+		case "$marker" in
+		day)
+			sed -i 's/^day_rx=.*/day_rx=0/; s/^day_tx=.*/day_tx=0/' "$f"
+			;;
+		month)
+			sed -i 's/^day_rx=.*/day_rx=0/; s/^day_tx=.*/day_tx=0/; s/^mon_rx=.*/mon_rx=0/; s/^mon_tx=.*/mon_tx=0/' "$f"
+			;;
+		*)
+			rm -f "$f"
+			;;
+		esac
+	done
+	log "Traffic statistics reset ($marker) requested from LuCI"
+}
+
+# Optional network-mode preference from the UI: keep the modem's ^SYSCFGEX
+# AcT-order string in sync (auto "080302" / NR only "08" / LTE only "03").
+apply_netmode() {
+	local want="$1" cur wantstr
+	case "$want" in
+	nr) wantstr="08" ;;
+	lte) wantstr="03" ;;
+	*) wantstr="080302" ;;
+	esac
+	[ -c "$MODEM_AT" ] || return 0
+	cur=$(at_cmd "$MODEM_AT" "AT^SYSCFGEX?" | sed -n 's/.*SYSCFGEX:[[:space:]]*"\([0-9]*\)".*/\1/p' | head -n 1)
+	[ "$cur" = "$wantstr" ] && return 0
+	log "Applying network mode '$want' (^SYSCFGEX \"$wantstr\", was \"${cur:-?}\")"
+	at_cmd "$MODEM_AT" "AT^SYSCFGEX=\"$wantstr\",3fffffff,2,4,7fffffffffffffff,," >/dev/null
+}
+
+bringup_once() {
+	local enabled sim_slot cfg_apn usb3_retrain fix_nvram thermal_guard netmode
+	config_load mt5700
+	config_get_bool enabled modem enabled 1
+	config_get sim_slot modem sim_slot "auto"
+	config_get cfg_apn modem apn ""
+	config_get_bool usb3_retrain modem usb3_retrain 1
+	config_get_bool fix_nvram modem fix_nvram 1
+	config_get_bool thermal_guard modem thermal_guard 1
+	config_get netmode modem netmode "auto"
+
+	apply_traffic_reset
+
+	if [ "$enabled" != "1" ]; then
+		# Honor the "cut power & stop dialing" contract: tear the session
+		# down and hard-off the modem (cpe-pwr is active-low) every tick,
+		# so a disable while connected takes effect within one cycle.
+		ifdown wwan >/dev/null 2>&1
+		gpio_set cpe-pwr 0
+		set_cellular_leds 0 0
+		rm -f "$STATUS_RAW_STAMP"
+		return 0
+	fi
+
+	# Ensure modem power is ON (active-low sysfs: 1 = ON)
+	if [ "$(gpio_get cpe-pwr)" = "0" ]; then
+		log "Powering on MT5700M-CN (cpe-pwr=1)"
+		gpio_set cpe-pwr 1
+		sleep 5
+	fi
+
+	if ! wait_for_modem 35; then
+		if ! cold_power_cycle_modem "3466:3301 absent on USB bus"; then
+			set_cellular_leds 0 0
+			rm -f "$STATUS_RAW_STAMP"
+			return 1
+		fi
+	fi
+
+	ensure_usb3 "$usb3_retrain" || return 1
+
+	# Never contend with netifd ncm.sh while it is actively talking to /dev/ttyUSB*
+	if wwan_is_pending; then
+		return 0
+	fi
+
+	# Snapshot AT state for the LuCI status page before the (possibly long)
+	# SIM probe / registration paths below hold the port for minutes.
+	refresh_status_raw || true
+
+	# Account traffic before anything below may reshuffle the netdev
+	record_traffic
+	record_session_baseline
+
+	# Monthly quota gate: 'offline' action tears the session down and stops
+	# dialing until the billing period rolls over or the limit is lifted
+	traffic_over_limit
+	case $? in
+	0)
+		ifdown wwan >/dev/null 2>&1
+		set_cellular_leds 0 0
+		if [ ! -f /tmp/mt5700.traffic_gate ]; then
+			touch /tmp/mt5700.traffic_gate
+			log "Monthly traffic limit reached; cellular set offline until next billing period (uci mt5700.modem.traffic_*)"
+		fi
+		return 0
+		;;
+	*)
+		rm -f /tmp/mt5700.traffic_gate
+		;;
+	esac
+
+	# Optional UI network-mode preference (nr/lte/auto)
+	apply_netmode "$netmode"
+
+	ensure_modem_nvram "$fix_nvram" || return 1
+
+	# Fast path: if wwan already has carrier + IP, the SIM slot config has not
+	# changed and the configured APN matches the dialed one, avoid re-running
+	# registration/APN setup; only check RAT LEDs (if off) and sample
+	# AT^CHIPTEMP? every 2nd daemon tick (~60s).
+	local active_slot led5_val led4_val tick cur_apn
+	active_slot=$(cat "$SLOT_STAMP" 2>/dev/null | tr -d ' \r\n')
+	cur_apn=$(uci -q get network.wwan.apn)
+	if [ -n "$MODEM_NET" ] && [ "$(cat "/sys/class/net/$MODEM_NET/carrier" 2>/dev/null)" = "1" ] && wwan_has_ip; then
+		rm -f "$PWR_RESCUE_STAMP"
+		apn_in_sync=0
+		case "$cfg_apn" in
+		""|auto) apn_in_sync=1 ;;
+		*) [ "$cfg_apn" = "$cur_apn" ] && apn_in_sync=1 ;;
+		esac
+		if { [ "$sim_slot" = "auto" ] || [ -z "$sim_slot" ] || [ "$sim_slot" = "$active_slot" ]; } && [ "$apn_in_sync" = "1" ]; then
+			led5_val=$(cat /sys/class/leds/blue:indicator-0/brightness 2>/dev/null | tr -d ' \r\n')
+			led4_val=$(cat /sys/class/leds/blue:indicator-1/brightness 2>/dev/null | tr -d ' \r\n')
+			if [ "${led5_val:-0}" = "0" ] && [ "${led4_val:-0}" = "0" ]; then
+				refresh_cellular_leds >/dev/null 2>&1
+			fi
+			tick=$(cat "$THERM_TICK_STAMP" 2>/dev/null | tr -cd '0-9')
+			tick=$(( ${tick:-0} + 1 ))
+			echo "$tick" > "$THERM_TICK_STAMP"
+			if [ $((tick % 2)) -eq 1 ] || [ -f "$FAN_BOOST_STAMP" ]; then
+				check_modem_thermal "$thermal_guard"
+			fi
+			return 0
+		fi
+	fi
+
+	check_modem_thermal "$thermal_guard"
+
+	# Sync discovered AT port & network device into UCI if changed
+	local uci_dirty=0 cur_dev cur_if imsi auto_apn target_apn
+	cur_dev=$(uci -q get network.wwan.device)
+	cur_if=$(uci -q get network.wwan.ifname)
+
+	if [ "$cur_dev" != "$MODEM_AT" ]; then
+		uci set network.wwan.device="$MODEM_AT"
+		uci_dirty=1
+	fi
+	if [ -n "$MODEM_NET" ] && [ "$cur_if" != "$MODEM_NET" ]; then
+		uci set network.wwan.ifname="$MODEM_NET"
+		uci_dirty=1
+	fi
+
+	if ! ensure_sim "$sim_slot"; then
+		set_cellular_leds 0 0
+		[ "$uci_dirty" = "1" ] && uci commit network
+		return 1
+	fi
+
+	# A route switch just invalidated the stamp: capture fresh SIM state
+	# immediately instead of leaving the LuCI page in 检测中 until the next tick.
+	[ -f "$STATUS_RAW_STAMP" ] || refresh_status_raw || true
+
+	imsi=$(at_cmd "$MODEM_AT" "AT+CIMI" | tr -cd '0-9' | head -c 15)
+	auto_apn=$(apn_from_imsi "$imsi")
+
+	if [ -n "$cfg_apn" ] && [ "$cfg_apn" != "auto" ]; then
+		target_apn="$cfg_apn"
+	elif [ -z "$cur_apn" ] || [ "$cur_apn" = "auto" ]; then
+		target_apn="$auto_apn"
+	else
+		target_apn="$cur_apn"
+	fi
+
+	if [ -n "$target_apn" ] && [ "$cur_apn" != "$target_apn" ]; then
+		uci set network.wwan.apn="$target_apn"
+		uci_dirty=1
+		log "IMSI ${imsi:-unknown} -> APN $target_apn"
+	elif [ "$cur_apn" = "auto" ] && [ -z "$target_apn" ]; then
+		uci -q delete network.wwan.apn
+		uci_dirty=1
+	fi
+
+	[ "$uci_dirty" = "1" ] && uci commit network
+
+	wait_registration || log "Modem registration still in progress; attempting NDISDUP dial"
+
+	if [ "$uci_dirty" = "1" ]; then
+		log "UCI updated; restarting wwan (AT=$MODEM_AT NET=${MODEM_NET:-auto} APN=${target_apn:-default} USB=${MODEM_SPEED:-?}M)"
+		ifup wwan </dev/null >/dev/null 2>&1
+	elif ! wwan_has_ip && ! wwan_is_pending; then
+		log "Bringing up wwan (AT=$MODEM_AT NET=${MODEM_NET:-auto} APN=${target_apn:-default} USB=${MODEM_SPEED:-?}M)"
+		ifup wwan </dev/null >/dev/null 2>&1
+	fi
+
+	return 0
+}
+
+acquire_lock() {
+	if lock -n "$LOCKFILE" 2>/dev/null; then
+		echo "$$" > "$PIDFILE"
+		return 0
+	fi
+	local holder
+	holder=$(cat "$PIDFILE" 2>/dev/null | tr -d ' \r\n')
+	if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+		log "Recovering stale mt5700 lock from dead PID $holder"
+		lock -u "$LOCKFILE" 2>/dev/null
+		rm -f "$LOCKFILE" "$PIDFILE"
+		if lock -n "$LOCKFILE" 2>/dev/null; then
+			echo "$$" > "$PIDFILE"
+			return 0
+		fi
+	fi
+	return 1
+}
+
+release_lock() {
+	rm -f "$PIDFILE"
+	lock -u "$LOCKFILE" 2>/dev/null
+}
+
+run_locked_once() {
+	acquire_lock || return 0
+	trap 'release_lock; exit 0' INT TERM
+	bringup_once
+	release_lock
+	trap - INT TERM
+}
+
+run_daemon() {
+	local interval opid
+	DAEMON_LOCKDIR="/var/lock/mt5700.daemon"
+
+	# Duplicate-instance guard: a previous daemon stuck in an uninterruptible
+	# AT port read can survive procd's SIGKILL and then race this instance for
+	# the tick lock. mkdir is atomic, so only one daemon can ever hold the
+	# lock dir. A missing pid file gets a short grace period before reclaim:
+	# the winning process may simply not have written its pid yet.
+	if ! mkdir "$DAEMON_LOCKDIR" 2>/dev/null; then
+		opid=$(cat "$DAEMON_LOCKDIR/pid" 2>/dev/null | tr -cd '0-9')
+		if [ -z "$opid" ]; then
+			sleep 2
+			opid=$(cat "$DAEMON_LOCKDIR/pid" 2>/dev/null | tr -cd '0-9')
+		fi
+		if [ -n "$opid" ] && [ "$opid" != "$$" ] && kill -0 "$opid" 2>/dev/null; then
+			log "Refusing to start: another mt5700 daemon (pid $opid) is already running"
+			return 1
+		fi
+		rm -rf "$DAEMON_LOCKDIR"
+		mkdir "$DAEMON_LOCKDIR" 2>/dev/null || return 1
+	fi
+	echo $$ > "$DAEMON_LOCKDIR/pid"
+
+	# Clean up only our own lock dir: a restarting procd may spawn the
+	# successor before this (dying) instance runs its trap, and the
+	# successor's dir must not be removed from under it.
+	daemon_cleanup() {
+		[ "$(cat "$DAEMON_LOCKDIR/pid" 2>/dev/null)" = "$$" ] && rm -rf "$DAEMON_LOCKDIR"
+		release_lock
+		exit 0
+	}
+	trap daemon_cleanup INT TERM
+	while true; do
+		if acquire_lock; then
+			bringup_once
+			release_lock
+		fi
+		config_load mt5700
+		config_get interval modem check_interval 30
+		[ "$interval" -ge 10 ] 2>/dev/null || interval=30
+		sleep "$interval"
+	done
+}
+
+case "${1:---once}" in
+--daemon)
+	run_daemon
+	;;
+*)
+	run_locked_once
+	;;
+esac

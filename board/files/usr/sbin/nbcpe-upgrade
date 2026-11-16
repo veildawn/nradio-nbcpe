@@ -1,0 +1,405 @@
+#!/bin/sh
+# NRadio NBCPE online firmware updater for LuCI (luci-app-nradio-nbcpe).
+# Talks to the project GitHub releases, downloads & verifies the sysupgrade
+# image in the background (state file polled by the UI), and is also used as
+# the pre-flight check before handing the image to /sbin/sysupgrade.
+#
+# Commands:
+#   check           query latest release + compare with running firmware
+#   info            identify the running firmware without network access
+#   download URL SHA256 [MIRROR] [TAG]   start background download+verify
+#   status          emit download progress/state as JSON
+#   preflight       verify downloaded image is ready to flash
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+
+REPO_API="https://api.github.com/repos/veildawn/nradio-nbcpe/releases/latest"
+STATE="/tmp/nbcpe-upgrade.state"
+BIN="/tmp/nbcpe-upgrade-sysupgrade.bin"
+PART="$BIN.part"
+CACHE="/tmp/nbcpe-upgrade.release"
+LOCK="/tmp/nbcpe-upgrade.lock"
+RELEASE_FILE="/rom/usr/share/nradio-nbcpe/release"
+umask 077
+
+cur_info() {
+	local b
+	CUR_REV="" CUR_DATE="" CUR_KERNEL="$(uname -r 2>/dev/null)"
+	b=$(ubus call system board 2>/dev/null)
+	if [ -n "$b" ]; then
+		json_load "$b"
+		if json_select release 2>/dev/null; then
+			json_get_var CUR_REV revision
+			json_get_var CUR_DATE builddate
+			json_select ..
+		fi
+		json_cleanup
+	fi
+	if [ -z "$CUR_DATE" ]; then
+		if [ -e /rom/etc/openwrt_release ]; then
+			CUR_DATE=$(date -r /rom/etc/openwrt_release +%s 2>/dev/null | tr -cd '0-9')
+		elif [ -e /etc/openwrt_release ]; then
+			CUR_DATE=$(date -r /etc/openwrt_release +%s 2>/dev/null | tr -cd '0-9')
+		fi
+	fi
+}
+
+do_info() {
+	cur_info
+	json_init
+	json_add_string "current_tag" "$(cat "$RELEASE_FILE" 2>/dev/null)"
+	json_add_string "current_rev" "$CUR_REV"
+	json_add_string "current_date" "$CUR_DATE"
+	json_add_string "current_kernel" "$CUR_KERNEL"
+	json_dump
+}
+
+error() {
+	json_init
+	json_add_string error "$1"
+	json_dump
+	return 1
+}
+
+state_set() {
+	# Readers always see a complete snapshot, including during verification.
+	local tmp="$STATE.$$"
+	: > "$tmp" || return 1
+	while [ $# -gt 0 ]; do
+		printf '%s=%s\n' "$1" "$2" >> "$tmp"
+		shift 2
+	done
+	mv -f "$tmp" "$STATE"
+}
+
+read_state() {
+	st=idle expected= sha= tag= msg= total=0 kernel=
+	[ -f "$STATE" ] || return 0
+	local key value
+	while IFS='=' read -r key value; do
+		case "$key" in
+		state) st="$value" ;; expected) expected="$value" ;;
+		sha256) sha="$value" ;; tag) tag="$value" ;; msg) msg="$value" ;;
+		total) total="$value" ;; kernel) kernel="$value" ;;
+		esac
+	done < "$STATE"
+}
+
+lock_live() {
+	local pid age mtime
+	read -r pid < "$LOCK/pid" 2>/dev/null || pid=""
+	if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then return 0; fi
+	# Allow the parent/setsid worker handoff to finish before reclaiming.
+	mtime="${1:-}"
+	[ -n "$mtime" ] || mtime=$(date -r "$LOCK/pid" +%s 2>/dev/null || date -r "$LOCK" +%s 2>/dev/null) || return 1
+	age=$(( $(date +%s) - mtime ))
+	[ "$age" -ge 0 ] && [ "$age" -lt 10 ]
+}
+
+acquire_lock() {
+	local mtime
+	if ! mkdir "$LOCK" 2>/dev/null; then
+		lock_live && return 1
+		mtime=$(date -r "$LOCK/pid" +%s 2>/dev/null || date -r "$LOCK" +%s 2>/dev/null)
+		# Serialize recovery too, so concurrent retries cannot remove a new lock.
+		mkdir "$LOCK/recover" 2>/dev/null || return 1
+		if lock_live "$mtime"; then rmdir "$LOCK/recover"; return 1; fi
+		rm -f "$LOCK/pid"
+		rmdir "$LOCK/recover"
+		rmdir "$LOCK" 2>/dev/null || return 1
+		mkdir "$LOCK" 2>/dev/null || return 1
+	fi
+	echo "$$" > "$LOCK/pid"
+}
+
+release_lock() {
+	local pid
+	read -r pid < "$LOCK/pid" 2>/dev/null || return 0
+	[ "$pid" = "$$" ] || return 0
+	rm -f "$LOCK/pid"
+	rmdir "$LOCK" 2>/dev/null
+}
+
+do_check() {
+	local raw tag pub url size sha sha_url rel_rev same rel_name rel_body notes_trimmed rel_kver cur_kver kmatch age
+	if [ "${1:-}" != "force" ] && [ -s "$CACHE" ]; then
+		age=$(( $(date +%s) - $(date -r "$CACHE" +%s) ))
+		if [ "$age" -ge 0 ] && [ "$age" -lt 300 ]; then cat "$CACHE"; return 0; fi
+	fi
+	raw=$(timeout 15 uclient-fetch -q -O - "$REPO_API" 2>/dev/null)
+	case "$raw" in
+	*"tag_name"*) ;;
+	*)
+		json_init
+		json_add_string "error" "无法访问 GitHub API（api.github.com），请检查上行网络"
+		json_dump
+		return 1
+		;;
+	esac
+
+	json_load "$raw"
+	json_get_var tag tag_name
+	json_get_var pub published_at
+	json_get_var rel_name name
+	json_get_var rel_body body
+	url=""
+	size=""
+	sha=""
+	sha_url=""
+	local keys key an dg
+	if json_select assets 2>/dev/null; then
+		json_get_keys keys
+		for key in $keys; do
+			json_select "$key" 2>/dev/null || continue
+			json_get_var an name
+			case "$an" in
+			*nradio_nbcpe-squashfs-sysupgrade.bin)
+				json_get_var url browser_download_url
+				json_get_var size size
+				# GitHub API asset digest (sha256) is fetched over the
+				# reachable api.github.com host and is the trust anchor
+				json_get_var dg digest
+				sha=$(printf '%s' "$dg" | sed -n 's/^sha256://p')
+				;;
+			sha256sums)
+				json_get_var sha_url browser_download_url
+				;;
+			esac
+			json_select ..
+		done
+		json_select ..
+	fi
+	json_cleanup
+
+	[ -n "$url" ] || {
+		json_init
+		json_add_string "error" "最新 Release 中未找到 sysupgrade 固件资产"
+		json_dump
+		return 1
+	}
+
+	# A release without a verifiable digest must not be downloadable: the
+	# whole online-upgrade trust model rests on the api.github.com digest
+	[ -n "$sha" ] || {
+		json_init
+		json_add_string "error" "最新 Release 资产缺少 SHA-256 摘要（digest），出于安全考虑拒绝在线升级"
+		json_dump
+		return 1
+	}
+
+	# Kernel match: this upgrade path writes the rootfs only, so a release
+	# built on a different kernel must not be flashed online (old kernel +
+	# new modules = broken USB/Wi-Fi). Release names carry "Linux <ver>".
+	rel_kver=$(printf '%s' "$rel_name" | sed -n 's/.*Linux \([0-9][0-9.]*\).*/\1/p')
+	cur_info
+	cur_kver="$CUR_KERNEL"
+	kmatch=-1
+	if [ -n "$rel_kver" ] && [ -n "$cur_kver" ]; then
+		kmatch=1
+		[ "$rel_kver" != "$cur_kver" ] && kmatch=0
+	fi
+
+	# CI puts the actual OpenWrt revision in the title. Older releases
+	# may identify their baseline only in the tag.
+	rel_rev=$(printf '%s\n' "$rel_name" | sed -n 's/^OpenWrt Snapshot \(r[0-9][0-9]*-[0-9a-f][0-9a-f]*\) (Linux .*/\1/p')
+	[ -n "$rel_rev" ] || rel_rev=$(printf '%s\n' "$tag" | sed -n 's/.*-\(r[0-9][0-9]*\)\(-[0-9a-f][0-9a-f]*\)\{0,1\}$/\1\2/p')
+	same=-1
+	if [ -n "$rel_rev" ] && [ -n "$CUR_REV" ]; then
+		same=0
+		case "$CUR_REV" in
+		"$rel_rev") same=1 ;;
+		"${rel_rev%%-*}"-*)
+			[ "$rel_rev" = "${rel_rev%%-*}" ] && same=1
+			;;
+		esac
+	fi
+	notes_trimmed=""
+	if [ -n "$rel_body" ]; then
+		# If byte 2001 continues a character, drop that character from the prefix.
+		notes_trimmed=$(printf '%s' "$rel_body" | LC_ALL=C awk '
+			BEGIN { left = 2000 }
+			NR > 1 { printf "\n"; left-- }
+			length($0) > left {
+				while (left > 0 && substr($0, left + 1, 1) ~ /[\200-\277]/)
+					left--
+				printf "%s", substr($0, 1, left)
+				exit
+			}
+			{ printf "%s", $0; left -= length($0) }
+			left == 0 { exit }
+		')
+	fi
+
+	json_init
+	json_add_string "tag" "$tag"
+	json_add_string "rev" "$rel_rev"
+	json_add_string "published" "$pub"
+	json_add_string "url" "$url"
+	json_add_int "size" "${size:-0}"
+	json_add_string "sha256" "$sha"
+	json_add_string "sha_url" "$sha_url"
+	json_add_int "same_base" "$same"
+	json_add_int "kernel_match" "$kmatch"
+	json_add_string "release_kernel" "$rel_kver"
+	json_add_string "current_kernel" "$cur_kver"
+	json_add_string "current_tag" "$(cat "$RELEASE_FILE" 2>/dev/null)"
+	json_add_string "current_rev" "$CUR_REV"
+	json_add_string "current_date" "$CUR_DATE"
+	json_add_string "notes" "$notes_trimmed"
+	json_dump > "$CACHE.$$" && mv -f "$CACHE.$$" "$CACHE"
+	cat "$CACHE"
+}
+
+do_download() {
+	local url="$1" digest="$2" mirror="${3:-}" release_tag="${4:-}" metadata size kver
+	case "$digest" in ''|*[!a-f0-9]*) error "SHA-256 摘要无效"; return 1 ;; esac
+	[ "${#digest}" -eq 64 ] || { error "SHA-256 摘要无效"; return 1; }
+	case "$mirror" in
+	"") ;;
+	https://?*) ;;
+	*) error "下载加速前缀必须以 https:// 开头"; return 1 ;;
+	esac
+	# Bind the request to API metadata, never to browser-supplied claims alone.
+	# kernel_match is informational only: the NBCPE sysupgrade refreshes
+	# kernel_2nd together with rootfs_2nd, so online upgrades across kernel
+	# versions are safe (unlike the TF-card C2000 build).
+	metadata=$(do_check) || { printf '%s\n' "$metadata"; return 1; }
+	json_load "$metadata"
+	json_get_var checked_url url
+	json_get_var checked_sha sha256
+	json_get_var checked_tag tag
+	json_get_var kver release_kernel
+	json_get_var size size
+	[ "$url" = "$checked_url" ] && [ "$digest" = "$checked_sha" ] && [ "$release_tag" = "$checked_tag" ] || {
+		error "Release 已变更，请重新检查后下载"; return 1
+	}
+	case "$release_tag" in *'
+'*) error "Release 标签无效"; return 1 ;; esac
+	acquire_lock || { error "已有下载或升级正在进行中"; return 1; }
+	[ -z "$mirror" ] || url="${mirror%/}/$url"
+	rm -f "$PART" "$BIN"
+	state_set state downloading expected "$digest" tag "$release_tag" total "$size" kernel "$kver" || {
+		release_lock; error "无法保存下载状态，请检查临时存储空间"; return 1
+	}
+	setsid /bin/sh "$0" _download "$url" "$digest" "$release_tag" "$size" "$kver" </dev/null >/dev/null 2>&1 &
+	json_init
+	json_add_boolean started 1
+	json_dump
+}
+
+download_worker() {
+	local url="$1" digest="$2" release_tag="$3" size="$4" kver="$5" got rc
+	echo "$$" > "$LOCK/pid"
+	trap release_lock EXIT
+	trap 'exit 1' INT TERM
+	wget -q -T 90 -O "$PART" "$url"
+	rc=$?
+	if [ "$rc" != 0 ] || [ ! -s "$PART" ]; then
+		state_set state error msg "下载失败（代码 $rc），请检查网络或更换下载加速前缀后重试"
+		rm -f "$PART"
+		return 1
+	fi
+	state_set state verifying expected "$digest" tag "$release_tag" total "$size" kernel "$kver"
+	got=$(sha256sum "$PART" | cut -d' ' -f1)
+	if [ "$got" != "$digest" ]; then
+		state_set state error msg "SHA-256 校验失败，请重新下载"
+		rm -f "$PART"
+		return 1
+	fi
+	mv "$PART" "$BIN" || { state_set state error msg "无法保存固件"; return 1; }
+	state_set state done expected "$digest" sha256 "$got" tag "$release_tag" total "$size" kernel "$kver"
+}
+
+do_status() {
+	local st expected sha tag msg total kernel got_bytes=0
+	read_state
+	case "$st" in
+	downloading|verifying|flashing)
+		if ! lock_live; then st=error; msg="任务已中断，请重新下载后重试"; fi ;;
+	esac
+	# ls reads file metadata; wc -c on BusyBox may scan the entire image.
+	if [ -f "$PART" ]; then
+		got_bytes=$(ls -ln "$PART" | awk '{print $5}')
+	elif [ -f "$BIN" ]; then
+		got_bytes=$(ls -ln "$BIN" | awk '{print $5}')
+	fi
+	json_init
+	json_add_string state "$st"
+	json_add_int bytes "${got_bytes:-0}"
+	json_add_int total "${total:-0}"
+	json_add_string expected "$expected"
+	json_add_string tag "$tag"
+	json_add_string sha256 "$sha"
+	json_add_string kernel "$kernel"
+	json_add_string msg "$msg"
+	json_add_boolean have_image $([ -s "$BIN" ] && echo 1 || echo 0)
+	json_dump
+}
+
+verify_image() {
+	local st expected sha tag msg total kernel got
+	read_state
+	[ "$st" = done ] && [ -s "$BIN" ] || { error "固件尚未就绪，请重新下载"; return 1; }
+	[ -z "${1:-}" ] || [ "$1" = "$expected" ] || {
+		error "待升级固件已变更，请刷新页面后重试"; return 1
+	}
+	got=$(sha256sum "$BIN" | cut -d' ' -f1)
+	[ -n "$expected" ] && [ "$got" = "$expected" ] || {
+		error "SHA-256 校验失败，请重新下载"; return 1
+	}
+	/sbin/sysupgrade -T "$BIN" >/dev/null 2>&1 || {
+		error "固件未通过设备兼容性检查，请重新下载适用的固件"; return 1
+	}
+}
+
+do_preflight() {
+	acquire_lock || { error "已有下载或升级正在进行中"; return 1; }
+	trap release_lock EXIT
+	verify_image "$1" || return 1
+	json_init
+	json_add_int ready 1
+	json_dump
+}
+
+do_flash() {
+	local mode="$1" digest="$2"
+	case "$mode" in keep|reset) ;; *) error "升级方式无效"; return 1 ;; esac
+	[ -n "$digest" ] || { error "缺少固件摘要，请刷新页面"; return 1; }
+	acquire_lock || { error "已有下载或升级正在进行中"; return 1; }
+	if ! verify_image "$digest"; then release_lock; return 1; fi
+	state_set state flashing || { release_lock; error "无法保存升级状态"; return 1; }
+	setsid /bin/sh "$0" _flash "$mode" </dev/null >/dev/null 2>&1 &
+	json_init
+	json_add_boolean started 1
+	json_dump
+}
+
+flash_worker() {
+	echo "$$" > "$LOCK/pid"
+	trap release_lock EXIT
+	trap 'exit 1' INT TERM
+	# Give rpcd time to deliver the acknowledgement before networking stops.
+	sleep 2
+	if [ "$1" = reset ]; then /sbin/sysupgrade -n "$BIN"; else /sbin/sysupgrade "$BIN"; fi
+	if [ "$?" -ne 0 ]; then
+		state_set state error msg "升级程序执行失败，请查看系统日志后重试"
+		return 1
+	fi
+	# A successful ubus handoff may return before procd stops services.
+	# Keep the image locked until shutdown, or report a stalled reboot later.
+	sleep 300
+	state_set state error msg "升级请求已提交，但未能确认重启，请检查系统日志"
+}
+
+case "${1:-}" in
+check) do_check "${2:-}" ;;
+download) do_download "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+status) do_status ;;
+info) do_info ;;
+preflight) do_preflight "${2:-}" ;;
+flash) do_flash "${2:-}" "${3:-}" ;;
+_download) download_worker "$2" "$3" "$4" "$5" "$6" ;;
+_flash) flash_worker "$2" ;;
+*) echo "Usage: $0 {check [force]|download <url> <sha256> [mirror-prefix] [tag]|status|preflight [sha256]|flash <keep|reset> <sha256>}" >&2; exit 1 ;;
+esac

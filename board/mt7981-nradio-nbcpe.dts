@@ -1,0 +1,247 @@
+// SPDX-License-Identifier: (GPL-2.0 OR MIT)
+/*
+ * NRadio NBCPE (WT9111) — MT7981A + MT7531 + MaxLinear GPY115 (2.5G WAN) + 8 GB eMMC
+ * + on-board TD Tech MT5700M-CN 5G modem (USB NCM).
+ *
+ * The stock bootloader boots the second system from PARTLABEL=kernel_2nd with
+ * this DTB and root=PARTLABEL=rootfs_2nd (squashfs + f2fs rootdisk overlay).
+ * Factory data (WiFi EEPROM on PARTLABEL=factory, board info on PARTLABEL=bdinfo)
+ * stays in the factory GPT layout and is only read.
+ */
+
+/dts-v1/;
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/linux-event-codes.h>
+#include "mt7981b.dtsi"
+
+/ {
+	model = "NRadio NBCPE (WT9111)";
+	compatible = "nradio,nbcpe", "mediatek,mt7981";
+
+	aliases {
+		serial0 = &uart0;
+		led-boot = &led_status;
+		led-failsafe = &led_status;
+		led-running = &led_status;
+		led-upgrade = &led_status;
+	};
+
+	chosen {
+		stdout-path = &uart0;
+		bootargs = "console=ttyS0,115200n1 loglevel=8 earlycon=uart8250,mmio32,0x11002000 root=PARTLABEL=rootfs_2nd rootfstype=squashfs,f2fs rootwait";
+	};
+
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x0 0x40000000 0x0 0x40000000>;
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+
+		button-reset {
+			label = "reset";
+			linux,input-type = <EV_KEY>;
+			linux,code = <KEY_RESTART>;
+			gpios = <&pio 1 GPIO_ACTIVE_LOW>;
+		};
+
+		button-wps {
+			label = "wps";
+			linux,input-type = <EV_KEY>;
+			linux,code = <KEY_WPS_BUTTON>;
+			gpios = <&pio 9 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	gpio-leds {
+		compatible = "gpio-leds";
+
+		led_status: led-status {
+			label = "blue:status";
+			gpios = <&pio 10 GPIO_ACTIVE_LOW>;
+		};
+
+		led-cmode5 {
+			label = "blue:cmode5";
+			gpios = <&pio 11 GPIO_ACTIVE_LOW>;
+		};
+
+		led-cmode4 {
+			label = "blue:cmode4";
+			gpios = <&pio 12 GPIO_ACTIVE_LOW>;
+		};
+
+		led-wifi {
+			label = "blue:wifi";
+			gpios = <&pio 13 GPIO_ACTIVE_LOW>;
+			linux,default-trigger = "phy0assoc";
+		};
+	};
+
+	reg_3p3v: regulator-3p3v {
+		compatible = "regulator-fixed";
+		regulator-name = "fixed-3.3V";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-boot-on;
+		regulator-always-on;
+	};
+
+	/* Modem full power path control (TD Tech MT5700M-CN), 1 = powered. */
+	gpio-export {
+		compatible = "gpio-export";
+
+		cpepower {
+			gpio-export,name = "cpe-pwr";
+			gpio-export,output = <1>;
+			gpios = <&pio 4 GPIO_ACTIVE_HIGH>;
+		};
+	};
+};
+
+&uart0 {
+	status = "okay";
+};
+
+&pio {
+	mmc0_pins_default: mmc0-pins-default {
+		mux {
+			function = "flash";
+			groups = "emmc_45";
+		};
+	};
+
+	mmc0_pins_uhs: mmc0-pins-uhs {
+		mux {
+			function = "flash";
+			groups = "emmc_45";
+		};
+	};
+};
+
+&eth {
+	status = "okay";
+
+	gmac0: mac@0 {
+		compatible = "mediatek,eth-mac";
+		reg = <0>;
+		phy-mode = "2500base-x";
+
+		fixed-link {
+			speed = <2500>;
+			full-duplex;
+			pause;
+		};
+	};
+};
+
+&mdio_bus {
+	phy5: ethernet-phy@5 {
+		compatible = "ethernet-phy-id67c9.de0a";
+		reg = <5>;
+		reset-gpios = <&pio 7 GPIO_ACTIVE_LOW>;
+		reset-assert-us = <600>;
+		reset-deassert-us = <20000>;
+	};
+
+	switch: switch@31 {
+		compatible = "mediatek,mt7531";
+		reg = <31>;
+		reset-gpios = <&pio 39 GPIO_ACTIVE_HIGH>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@1 {
+				reg = <1>;
+				label = "lan1";
+			};
+
+			port@2 {
+				reg = <2>;
+				label = "lan2";
+			};
+
+			port@3 {
+				reg = <3>;
+				label = "lan3";
+			};
+
+			port@5 {
+				reg = <5>;
+				label = "wan";
+				phy-mode = "2500base-x";
+				phy-handle = <&phy5>;
+			};
+
+			port@6 {
+				reg = <6>;
+				label = "cpu";
+				ethernet = <&gmac0>;
+				phy-mode = "2500base-x";
+
+				fixed-link {
+					speed = <2500>;
+					full-duplex;
+					pause;
+				};
+			};
+		};
+	};
+};
+
+&mmc0 {
+	status = "okay";
+	pinctrl-names = "default", "state_uhs";
+	pinctrl-0 = <&mmc0_pins_default>;
+	pinctrl-1 = <&mmc0_pins_uhs>;
+	bus-width = <8>;
+	max-frequency = <52000000>;
+	cap-mmc-highspeed;
+	vmmc-supply = <&reg_3p3v>;
+	non-removable;
+	no-sd;
+	no-sdio;
+
+	card@0 {
+		compatible = "mmc-card";
+		reg = <0>;
+
+		block {
+			compatible = "block-device";
+
+			partitions {
+				compatible = "fixed-partitions";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				/*
+				 * The factory GPT is discovered by partition name; expose the
+				 * WiFi EEPROM region (MT7981 header + cal data, MAC @ 0x4) of
+				 * PARTLABEL=factory to mt76 as a read-only nvmem cell.
+				 */
+				block-partition-factory {
+					partname = "factory";
+
+					nvmem-layout {
+						compatible = "fixed-layout";
+						#address-cells = <1>;
+						#size-cells = <1>;
+
+						eeprom_factory_0: eeprom@0 {
+							reg = <0x0 0x1000>;
+						};
+					};
+				};
+			};
+		};
+	};
+};
+
+&wifi {
+	status = "okay";
+	nvmem-cells = <&eeprom_factory_0>;
+	nvmem-cell-names = "eeprom";
+};

@@ -1,0 +1,81 @@
+#!/bin/sh
+# Safe Dual-OS boot target switcher for NRadio NBCPE (WT9111).
+# The stock bootloader selects the boot slot from `boot_system` stored in the
+# eMMC "u-boot-env" partition (PARTLABEL=u-boot-env, non-CRC MTK layout):
+#   boot_system=0 -> factory system  (kernel   + rootfs)
+#   boot_system=1 -> second system   (kernel_2nd + rootfs_2nd, e.g. OpenWrt)
+# The factory `ubenv` tool is reused verbatim so the on-flash format stays
+# bit-compatible with the stock firmware; we refuse to write unless the
+# environment lists the expected known-good variables.
+
+set -u
+
+UBENV=/usr/bin/ubenv
+VAR="boot_system"
+
+env_list() {
+	"$UBENV" -o 3 2>/dev/null
+}
+
+env_get() {
+	"$UBENV" -o 1 -s "$VAR" 2>/dev/null
+}
+
+env_sane() {
+	local out
+	out=$(env_list)
+	[ -n "$out" ] || return 1
+	printf '%s\n' "$out" | grep -qE '^(boot_system|bootdelay|baudrate)' || return 1
+	[ "$(printf '%s\n' "$out" | wc -l)" -ge 5 ] || return 1
+	return 0
+}
+
+switch_target() {
+	local want="$1" label="$2" cur got
+	command -v "$UBENV" >/dev/null 2>&1 || { echo "ERROR: $UBENV not found" >&2; return 1; }
+	[ -b "$(blkid -t PARTLABEL=u-boot-env -o device 2>/dev/null)" ] || {
+		echo "ERROR: PARTLABEL=u-boot-env block device not found" >&2
+		return 1
+	}
+	env_sane || { echo "ERROR: u-boot-env sanity check failed; refusing to write" >&2; return 1; }
+
+	cur=$(env_get)
+	if [ "$cur" = "$want" ]; then
+		echo "$VAR is already $want ($label)."
+		return 0
+	fi
+	"$UBENV" -o 0 -s "$VAR" -v "$want" >/dev/null 2>&1 || {
+		echo "ERROR: ubenv write failed; boot target unchanged." >&2
+		return 1
+	}
+	got=$(env_get)
+	if [ "$got" != "$want" ]; then
+		echo "ERROR: read-back mismatch (got '$got', expected '$want')." >&2
+		return 1
+	fi
+	echo "Updated $VAR=$want ($label). Run 'reboot' to boot into $label."
+	return 0
+}
+
+case "${1:-status}" in
+status|check)
+	command -v "$UBENV" >/dev/null 2>&1 || { echo "ERROR: $UBENV not found" >&2; exit 1; }
+	cur=$(env_get)
+	case "$cur" in
+	1) desc="openwrt-second-system" ;;
+	0) desc="factory-system" ;;
+	*) desc="unknown" ;;
+	esac
+	echo "${VAR}=${cur:-unset} (${desc})"
+	;;
+to-factory|to-official)
+	switch_target 0 "factory system (onboard eMMC slot 0)"
+	;;
+to-openwrt|to-second)
+	switch_target 1 "OpenWrt (eMMC second system)"
+	;;
+*)
+	echo "Usage: $0 {status|check|to-factory|to-openwrt}" >&2
+	exit 1
+	;;
+esac

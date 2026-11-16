@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""Apply the NRadio NBCPE (WT9111) board port onto an official OpenWrt main tree."""
+
+import json
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+
+from platform_upgrade import patch_platform_upgrade
+
+
+EXEC_DIRS = {"init.d", "uci-defaults", "sbin", "bin"}
+
+
+def copy_board_files(files_dir: Path, base_files: Path) -> None:
+    if not files_dir.is_dir():
+        return
+    for src in sorted(files_dir.rglob("*")):
+        if src.is_dir():
+            continue
+        rel = src.relative_to(files_dir)
+        dst = base_files / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+        if any(part in EXEC_DIRS for part in rel.parts):
+            dst.chmod(0o755)
+        else:
+            dst.chmod(0o644)
+    for d in sorted(base_files.rglob("*")):
+        if d.is_dir():
+            d.chmod(0o755)
+
+
+def main() -> None:
+    os.umask(0o022)
+    if len(sys.argv) < 2:
+        sys.exit(f"Usage: {sys.argv[0]} <openwrt-dir> [board-dir]")
+
+    root = Path(sys.argv[1]).resolve()
+    board_dir = (
+        Path(sys.argv[2]).resolve()
+        if len(sys.argv) >= 3
+        else Path(__file__).resolve().parent
+    )
+
+    mk_path = root / "target/linux/mediatek/image/filogic.mk"
+    mk_text = mk_path.read_text()
+    if "define Device/nradio_nbcpe\n" in mk_text:
+        sys.exit("ERROR: use a clean OpenWrt source tree for this board port.")
+
+    # 1. Copy board DTS
+    dts_src = board_dir / "mt7981-nradio-nbcpe.dts"
+    dts_dst = root / "target/linux/mediatek/dts/mt7981-nradio-nbcpe.dts"
+    shutil.copyfile(dts_src, dts_dst)
+
+    # 2. Install board files in the Filogic base-files tree.
+    base_files = root / "target/linux/mediatek/filogic/base-files"
+    copy_board_files(board_dir / "files", base_files)
+
+    # 3. Register Device/nradio_nbcpe in filogic.mk
+    device_block = """define Device/nradio_nbcpe
+  DEVICE_VENDOR := NRadio
+  DEVICE_MODEL := NBCPE (WT9111)
+  DEVICE_DTS := mt7981-nradio-nbcpe
+  DEVICE_DTS_DIR := ../dts
+  SUPPORTED_DEVICES += nradio,nbcpe
+  KERNEL_LOADADDR := 0x48000000
+  DEVICE_PACKAGES := kmod-usb3 kmod-usb-serial-option kmod-usb-net-cdc-ether \\
+\tkmod-usb-net-cdc-ncm kmod-usb-net-huawei-cdc-ncm kmod-usb-net-rndis \\
+\tkmod-usb-net-qmi-wwan comgt-ncm uqmi \\
+\tkmod-mt7915e kmod-mt7981-firmware \\
+\te2fsprogs f2fsck mkf2fs kmod-fs-f2fs kmod-tun zram-swap
+  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+endef
+TARGET_DEVICES += nradio_nbcpe
+
+"""
+    anchor = "define Device/nradio_c8-668gl"
+    if anchor not in mk_text:
+        sys.exit("ERROR: anchor missing in filogic.mk")
+    mk_path.write_text(mk_text.replace(anchor, device_block + anchor, 1))
+
+    # 4. Update 02_network (lan1-3 = MT7531, wan = GPY115 on switch port5,
+    #    base MAC from eMMC bdinfo/factory)
+    net_path = root / "target/linux/mediatek/filogic/base-files/etc/board.d/02_network"
+    net_text = net_path.read_text()
+
+    board_block = (
+        "\tnradio,nbcpe)\n"
+        "\t\tucidef_set_interfaces_lan_wan \"lan1 lan2 lan3\" \"wan\"\n"
+        "\t\t. /lib/functions/nradio-nbcpe.sh\n"
+        "\t\tlan_mac=$(nbcpe_get_base_mac)\n"
+        '\t\t[ -n "$lan_mac" ] && wan_mac=$(macaddr_add "$lan_mac" 1)\n'
+        "\t\tlabel_mac=$lan_mac\n"
+        "\t\t;;\n"
+    )
+    existing_re = re.compile(
+        r"\tnradio,nbcpe\)\n.*?\t\t;;\n(?=\tnradio,c8-668gl\))",
+        re.S,
+    )
+    if existing_re.search(net_text):
+        net_text = existing_re.sub(board_block, net_text, count=1)
+    else:
+        mac_anchor = "\tnradio,c8-668gl)\n"
+        if mac_anchor not in net_text:
+            sys.exit("ERROR: anchor missing in 02_network")
+        net_text = net_text.replace(mac_anchor, board_block + mac_anchor, 1)
+    net_path.write_text(net_text)
+
+    # 4b. Update 11_fix_wifi_mac (repair invalid EEPROM MACs from bdinfo base)
+    wifi_mac_path = (
+        root
+        / "target/linux/mediatek/filogic/base-files/etc/hotplug.d/ieee80211/11_fix_wifi_mac"
+    )
+    wifi_mac_text = wifi_mac_path.read_text()
+    wifi_mac_block = (
+        "\tnradio,nbcpe)\n"
+        "\t\t. /lib/functions/nradio-nbcpe.sh\n"
+        '\t\tcur_mac=$(cat /sys${DEVPATH}/macaddress 2>/dev/null)\n'
+        '\t\tif ! nbcpe_mac_is_valid_unicast "$cur_mac"; then\n'
+        "\t\t\tbase_mac=$(nbcpe_get_base_mac)\n"
+        '\t\t\tif [ -n "$base_mac" ]; then\n'
+        '\t\t\t\t[ "$PHYNBR" = "0" ] && macaddr_add "$base_mac" 0 > /sys${DEVPATH}/macaddress\n'
+        '\t\t\t\t[ "$PHYNBR" = "1" ] && macaddr_add "$base_mac" 1 > /sys${DEVPATH}/macaddress\n'
+        "\t\t\tfi\n"
+        "\t\tfi\n"
+        "\t\t;;\n"
+    )
+    existing_wifi_re = re.compile(
+        r"\tnradio,nbcpe\)\n.*?\t\t;;\n(?=\tnradio,c8-668gl\))",
+        re.S,
+    )
+    if existing_wifi_re.search(wifi_mac_text):
+        wifi_mac_text = existing_wifi_re.sub(wifi_mac_block, wifi_mac_text, count=1)
+    else:
+        wifi_anchor = "\tnradio,c8-668gl)\n"
+        if wifi_anchor not in wifi_mac_text:
+            sys.exit("ERROR: anchor missing in 11_fix_wifi_mac")
+        wifi_mac_text = wifi_mac_text.replace(
+            wifi_anchor, wifi_mac_block + wifi_anchor, 1
+        )
+    wifi_mac_path.write_text(wifi_mac_text)
+
+    # 5. Install the eMMC second-system upgrade and configuration backup path.
+    plat_path = root / "target/linux/mediatek/filogic/base-files/lib/upgrade/platform.sh"
+    plat_path.write_text(patch_platform_upgrade(plat_path.read_text()))
+
+    # 6. Configure comgt ncm.json with verified 5G NR profile for TD Tech MT5700M-CN
+    ncm_path = root / "package/network/utils/comgt/files/ncm.json"
+    ncm_data = json.loads(ncm_path.read_text())
+    mt5700m_profile = {
+        "initialize": [
+            "AT",
+            "ATQ0",
+            "ATV1",
+            "ATE1",
+            "ATS0=0",
+            "AT+CFUN=1",
+            r'AT+CGDCONT=${profile},\"${pdptype}\"${apn:+,\"$apn\"}',
+        ],
+        "modes": {
+            "prefer5g": r'AT^SYSCFGEX=\"080302\",3fffffff,1,2,7fffffffffffffff,,',
+            "5g": r'AT^SYSCFGEX=\"08\",3fffffff,1,2,7fffffffffffffff,,',
+            "preferlte": r'AT^SYSCFGEX=\"0302\",3fffffff,1,2,7fffffffffffffff,,',
+            "lte": r'AT^SYSCFGEX=\"03\",3fffffff,1,2,7fffffffffffffff,,',
+            "umts": r'AT^SYSCFGEX=\"02\",3fffffff,1,2,7fffffffffffffff,,',
+            "auto": r'AT^SYSCFGEX=\"080302\",3fffffff,1,2,7fffffffffffffff,,',
+        },
+        "connect": r'AT^NDISDUP=${profile},1${apn:+,\"$apn\"}${username:+,\"$username\",\"$password\"${auth:+,$auth}}',
+        "disconnect": "AT^NDISDUP=${profile},0",
+    }
+    for alias in (
+        "td-mt5700m",
+        "tdtech-mt5700m",
+        "huawei-mt5700m",
+        '"td-mt5700m',
+        '"tdtech-mt5700m',
+        '"huawei-mt5700m',
+        "td",
+        "tdtech",
+        "huawei",
+        '"td',
+        '"tdtech',
+        '"huawei',
+        "hisilicon",
+    ):
+        ncm_data[alias] = mt5700m_profile
+    ncm_path.write_text(json.dumps(ncm_data, indent="\t") + "\n")
+
+    print("Successfully applied NRadio NBCPE port to", root)
+
+
+if __name__ == "__main__":
+    main()

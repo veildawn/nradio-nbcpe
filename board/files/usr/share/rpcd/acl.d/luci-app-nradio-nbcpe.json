@@ -1,0 +1,37 @@
+{
+	"luci-app-nradio-nbcpe": {
+		"description": "Grant access to NRadio NBCPE 5G modem, dual-boot and online upgrade management",
+		"read": {
+			"file": {
+				"/usr/sbin/mt5700-status": [
+					"exec"
+				]
+			},
+			"uci": [
+				"mt5700"
+			]
+		},
+		"write": {
+			"file": {
+				"/usr/sbin/nbcpe-bootswitch": [
+					"exec"
+				],
+				"/usr/sbin/mt5700-status": [
+					"exec"
+				],
+				"/usr/sbin/nbcpe-upgrade": [
+					"exec"
+				],
+				"/sbin/reboot": [
+					"exec"
+				],
+				"/sbin/sysupgrade": [
+					"exec"
+				]
+			},
+			"uci": [
+				"mt5700"
+			]
+		}
+	}
+}

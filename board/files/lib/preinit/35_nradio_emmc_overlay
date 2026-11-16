@@ -1,0 +1,33 @@
+# Require a second-system eMMC boot layout before OpenWrt can pick an overlay:
+# root must be the squashfs on PARTLABEL=rootfs_2nd while the factory system
+# partitions (kernel/rootfs/u-boot-env/factory/bdinfo/fip) stay untouched.
+nradio_emmc_overlay_guard() {
+	[ "$(board_name)" = "nradio,nbcpe" ] || return 0
+	local second_dev second_majmin root_fs ok=1
+
+	second_dev="$(blkid -t PARTLABEL=rootfs_2nd -o device 2>/dev/null)"
+	[ -n "$second_dev" ] || ok=0
+
+	if [ "$ok" = "1" ]; then
+		second_majmin="$(cat "/sys/class/block/$(basename "$second_dev")/dev" 2>/dev/null)"
+		awk -v d="$second_majmin" '
+			$3 == d && $5 == "/" && $8 == "squashfs" { found = 1 }
+			END { exit !found }' /proc/self/mountinfo || ok=0
+	fi
+
+	if [ "$ok" = "1" ]; then
+		# Guard against the factory layout: an OpenWrt second-system boot must
+		# never expose the factory kernel/rootfs pair as its writable root.
+		for label in kernel rootfs u-boot-env factory bdinfo fip; do
+			blkid -t "PARTLABEL=$label" -o device >/dev/null 2>&1 || ok=0
+		done
+	fi
+
+	[ "$ok" = "1" ] && return 0
+
+	echo "NRadio: eMMC second-system overlay unavailable; reinstall from the factory Web UI." > /dev/console
+	export FAILSAFE=true
+	touch /tmp/failsafe
+}
+
+boot_hook_add preinit_main nradio_emmc_overlay_guard

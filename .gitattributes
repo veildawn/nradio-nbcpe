@@ -1,0 +1,5 @@
+# The stock ubenv tool ships as a prebuilt aarch64/musl binary (bit-compatible
+# boot-env writer for the factory eMMC layout); keep it versioned as-is.
+board/files/usr/bin/ubenv binary
+*.dts diff=dts linguist-language=C
+*.dtsi diff=dts linguist-language=C

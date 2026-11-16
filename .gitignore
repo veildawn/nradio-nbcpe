@@ -1,0 +1,13 @@
+# local exploration / verification scratch (stock firmware analysis)
+work/
+# original firmware dumps and router session artifacts (kept out of git; see nradio-backup/)
+nradio-backup/
+# ImageBuilder / build outputs
+ib/
+ib.tar.zst
+*.log
+__pycache__/
+.DS_Store
+
+# agent session artifacts
+.zcode/
