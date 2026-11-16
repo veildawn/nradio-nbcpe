@@ -30,6 +30,7 @@ DEVICE_PACKAGES = [
     "uqmi",
     "kmod-mt7915e",
     "kmod-mt7981-firmware",
+    "blkid",
     "e2fsprogs",
     "f2fsck",
     "mkf2fs",

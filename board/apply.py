@@ -71,7 +71,7 @@ def main() -> None:
 \tkmod-usb-net-cdc-ncm kmod-usb-net-huawei-cdc-ncm kmod-usb-net-rndis \\
 \tkmod-usb-net-qmi-wwan comgt-ncm uqmi \\
 \tkmod-mt7915e kmod-mt7981-firmware \\
-\te2fsprogs f2fsck mkf2fs kmod-fs-f2fs kmod-tun zram-swap
+\tblkid e2fsprogs f2fsck mkf2fs kmod-fs-f2fs kmod-tun zram-swap
   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
 endef
 TARGET_DEVICES += nradio_nbcpe

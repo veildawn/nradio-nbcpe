@@ -3,15 +3,19 @@
 # partitions (kernel/rootfs/u-boot-env/factory/bdinfo/fip) stay untouched.
 nradio_emmc_overlay_guard() {
 	[ "$(board_name)" = "nradio,nbcpe" ] || return 0
-	local second_dev second_majmin root_fs ok=1
+	local second_dev second_majmin factory_dev label ok=1
 
-	second_dev="$(blkid -t PARTLABEL=rootfs_2nd -o device 2>/dev/null)"
+	second_dev="$(blkid -t PARTLABEL=rootfs_2nd -o device 2>/dev/null)" || ok=0
 	[ -n "$second_dev" ] || ok=0
 
 	if [ "$ok" = "1" ]; then
 		second_majmin="$(cat "/sys/class/block/$(basename "$second_dev")/dev" 2>/dev/null)"
 		awk -v d="$second_majmin" '
-			$3 == d && $5 == "/" && $8 == "squashfs" { found = 1 }
+			$3 == d && $5 == "/" {
+				# Optional mountinfo fields precede the "-" separator.
+				for (i = 7; i < NF; i++)
+					if ($i == "-" && $(i + 1) == "squashfs") found = 1
+			}
 			END { exit !found }' /proc/self/mountinfo || ok=0
 	fi
 
@@ -19,13 +23,18 @@ nradio_emmc_overlay_guard() {
 		# Guard against the factory layout: an OpenWrt second-system boot must
 		# never expose the factory kernel/rootfs pair as its writable root.
 		for label in kernel rootfs u-boot-env factory bdinfo fip; do
-			blkid -t "PARTLABEL=$label" -o device >/dev/null 2>&1 || ok=0
+			factory_dev="$(blkid -t "PARTLABEL=$label" -o device 2>/dev/null)" || ok=0
+			[ -n "$factory_dev" ] || ok=0
 		done
 	fi
 
 	[ "$ok" = "1" ] && return 0
 
-	echo "NRadio: eMMC second-system overlay unavailable; reinstall from the factory Web UI." > /dev/console
+	if ! command -v blkid >/dev/null 2>&1; then
+		echo "NRadio: required blkid utility missing; cannot verify second-system partitions." > /dev/console
+	else
+		echo "NRadio: eMMC second-system root or factory partition layout could not be verified." > /dev/console
+	fi
 	export FAILSAFE=true
 	touch /tmp/failsafe
 }

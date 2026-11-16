@@ -1,7 +1,7 @@
 #!/bin/sh
 # Safe Dual-OS boot target switcher for NRadio NBCPE (WT9111).
 # The stock bootloader selects the boot slot from `boot_system` stored in the
-# eMMC "u-boot-env" partition (PARTLABEL=u-boot-env, non-CRC MTK layout):
+# eMMC "u-boot-env" partition (512 KiB, standard U-Boot CRC32 layout):
 #   boot_system=0 -> factory system  (kernel   + rootfs)
 #   boot_system=1 -> second system   (kernel_2nd + rootfs_2nd, e.g. OpenWrt)
 # The factory `ubenv` tool is reused verbatim so the on-flash format stays
@@ -18,14 +18,18 @@ env_list() {
 }
 
 env_get() {
-	"$UBENV" -o 1 -s "$VAR" 2>/dev/null
+	local out
+	out=$("$UBENV" -o 1 -s "$VAR" 2>/dev/null) || return 1
+	# The factory tool prints "boot_system = 0", not a bare value.
+	printf '%s\n' "$out" | sed -n 's/^boot_system[[:space:]]*=[[:space:]]*\([01]\)[[:space:]]*$/\1/p'
 }
 
 env_sane() {
 	local out
-	out=$(env_list)
+	out=$(env_list) || return 1
 	[ -n "$out" ] || return 1
-	printf '%s\n' "$out" | grep -qE '^(boot_system|bootdelay|baudrate)' || return 1
+	printf '%s\n' "$out" | grep -qE '^boot_system=[01]$' || return 1
+	printf '%s\n' "$out" | grep -qE '^baudrate=115200$' || return 1
 	[ "$(printf '%s\n' "$out" | wc -l)" -ge 5 ] || return 1
 	return 0
 }
@@ -40,12 +44,13 @@ switch_target() {
 	env_sane || { echo "ERROR: u-boot-env sanity check failed; refusing to write" >&2; return 1; }
 
 	cur=$(env_get)
+	case "$cur" in 0|1) ;; *) echo "ERROR: invalid boot_system; refusing to write." >&2; return 1 ;; esac
 	if [ "$cur" = "$want" ]; then
 		echo "$VAR is already $want ($label)."
 		return 0
 	fi
 	"$UBENV" -o 0 -s "$VAR" -v "$want" >/dev/null 2>&1 || {
-		echo "ERROR: ubenv write failed; boot target unchanged." >&2
+		echo "ERROR: ubenv write failed; recheck boot target before rebooting." >&2
 		return 1
 	}
 	got=$(env_get)
@@ -64,7 +69,7 @@ status|check)
 	case "$cur" in
 	1) desc="openwrt-second-system" ;;
 	0) desc="factory-system" ;;
-	*) desc="unknown" ;;
+	*) echo "ERROR: could not read a valid boot_system." >&2; exit 1 ;;
 	esac
 	echo "${VAR}=${cur:-unset} (${desc})"
 	;;

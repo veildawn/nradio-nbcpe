@@ -43,9 +43,9 @@ class EmmcOverlayTests(unittest.TestCase):
                 guard = guard.replace(original, str(fixture / filename))
             guard = guard.replace("blkid ", f'"{fixture}/blkid" ')
 
-            def run_case(root_dev, fs, parts):
+            def run_case(root_dev, fs, parts, optional=""):
                 (fixture / "mountinfo").write_text(
-                    f"17 0 {root_dev} / / ro - {fs} /dev/root ro\n"
+                    f"17 0 {root_dev} / / ro {optional}- {fs} /dev/root ro\n"
                 )
                 (fixture / "parts").write_text("".join(parts))
                 (fixture / "sys_block" / "mmcblk0p9").mkdir(parents=True, exist_ok=True)
@@ -68,6 +68,16 @@ class EmmcOverlayTests(unittest.TestCase):
 
             # Happy path: squashfs on rootfs_2nd + full factory GPT layout
             self.assertEqual(run_case("179:9", "squashfs", all_parts), "")
+            self.assertEqual(run_case("179:9", "squashfs", all_parts, "shared:1 "), "")
+
+            # A successful blkid invocation with no match is not a partition.
+            missing_factory = [p for p in all_parts if not p.startswith("factory=")]
+            self.assertEqual(run_case("179:9", "squashfs", missing_factory), "true")
+
+            # Reproduce the shipped firmware: the blkid command is absent.
+            (fixture / "blkid").rename(fixture / "blkid.disabled")
+            self.assertEqual(run_case("179:9", "squashfs", all_parts), "true")
+            (fixture / "blkid.disabled").rename(fixture / "blkid")
 
             # Root filesystem not squashfs (e.g. factory ext4 boot)
             self.assertEqual(run_case("179:9", "ext4", all_parts), "true")
