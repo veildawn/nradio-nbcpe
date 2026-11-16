@@ -1,0 +1,84 @@
+#!/bin/sh
+# Explicit two-slot ODU operation; never imports or edits the factory UCI tree.
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+[ "$(board_name)" = "nradio,nbcpe" ] || exit 1
+[ "$(uci -q get mt5700.modem.transport)" != "usb" ] || exit 1
+umask 077
+STATE=/tmp/mt5700.sim.json
+RUN=/tmp/mt5700.sim.running
+LOCK=/var/lock/mt5700.ethernet.lock
+SAMPLER=/usr/share/nradio-nbcpe/mt5700-ethernet.uc
+
+state() {
+	json_init
+	json_add_string state "$1"
+	json_add_string target "$target"
+	json_add_string error "${2:-}"
+	json_dump > "$STATE.$$" && mv -f "$STATE.$$" "$STATE"
+}
+
+worker() {
+	held=0
+	trap '[ "$held" = 0 ] || lock -u "$LOCK"; rm -rf "$RUN"; rm -f "$STATE.$$"' EXIT
+	trap 'state error "切换被中断，请刷新确认当前 SIM"; exit 1' INT TERM
+	for i in $(seq 1 50); do
+		if lock -n "$LOCK"; then held=1; break; fi
+		sleep 1
+	done
+	[ "$held" = 1 ] || { state error '采样正忙，请稍后重试'; return 1; }
+	current=$(timeout 5 ucode "$SAMPLER" --slot 2>/dev/null) || {
+		state error '无法读取当前 SIM，尚未执行切换'; return 1;
+	}
+	if [ "$current" = "$target" ]; then
+		state done
+		return 0
+	fi
+	# A previous slot's identity/signal must not survive into the switching view.
+	rm -f /tmp/mt5700.ethernet.raw
+	/usr/sbin/nbcpe-leds >/dev/null 2>&1
+	if ! timeout 40 ucode "$SAMPLER" --switch "$target" > "$RUN/result" 2> "$RUN/error"; then
+		state error '模组未确认切换，请刷新查看当前 SIM 后重试'
+		return 1
+	fi
+	# Restart acknowledgement is not completion. Wait for the real slot readback.
+	sleep 3
+	for i in $(seq 1 30); do
+		current=$(timeout 5 ucode "$SAMPLER" --slot 2>/dev/null)
+		if [ "$current" = "$target" ]; then
+			state done
+			lock -u "$LOCK"; held=0
+			/usr/sbin/mt5700-ethernet --once >/dev/null 2>&1
+			/usr/sbin/nbcpe-leds >/dev/null 2>&1
+			return 0
+		fi
+		sleep 3
+	done
+	state error '等待模组恢复超时，请检查当前 SIM 和网口连接'
+	return 1
+}
+
+case "$1" in
+--worker)
+	target="$2"
+	case "$target" in internal|external) ;; *) exit 1 ;; esac
+	[ -d "$RUN" ] || exit 1
+	worker
+	;;
+internal|external)
+	target="$1"
+	[ "$#" = 1 ] || exit 1
+	if ! mkdir "$RUN" 2>/dev/null; then
+		echo 'SIM 正在切换，请等待完成' >&2
+		exit 1
+	fi
+	state switching
+	setsid /bin/sh "$0" --worker "$target" </dev/null >/dev/null 2>&1 &
+	json_init
+	json_add_boolean started 1
+	json_add_string target "$target"
+	json_add_string state switching
+	json_dump
+	;;
+*) echo "Usage: $0 {internal|external}" >&2; exit 1 ;;
+esac

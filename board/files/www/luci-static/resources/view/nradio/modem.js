@@ -33,6 +33,7 @@ var MODEM_CSS = [
 	'.nr-md-tab{padding:.55rem 1rem;cursor:pointer;border-bottom:2.5px solid transparent;margin-bottom:-1.5px;font-size:.88rem;font-weight:500;color:var(--nr-muted);white-space:nowrap;user-select:none}',
 	'.nr-md-tab:hover{color:var(--nr-text)}',
 	'.nr-md-tab.active{color:var(--nr-primary);border-bottom-color:var(--nr-primary);font-weight:600}',
+	'.nr-md-tab:focus-visible{outline:2px solid var(--nr-primary);outline-offset:-3px}',
 	'.nr-md-grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}',
 	'@media(max-width:780px){.nr-md-grid2{grid-template-columns:1fr}}',
 	'.nr-md-grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.8rem}',
@@ -50,7 +51,7 @@ var MODEM_CSS = [
 	'.nr-md-copychip{display:inline-flex;align-items:center;gap:.35rem;flex-wrap:wrap}',
 	'.nr-md-gauge{background:var(--nr-subtle);border:1px solid var(--nr-border-soft);border-radius:10px;padding:.8rem .9rem;display:flex;flex-direction:column;gap:.4rem}',
 	'.nr-md-gauge-bar{height:8px;border-radius:999px;background:var(--nr-card);border:1px solid var(--nr-border-soft);overflow:hidden}',
-	'.nr-md-gauge-fill{height:100%;border-radius:999px;transition:width .35s ease}',
+	'.nr-md-gauge-fill{height:100%;border-radius:999px}',
 	'.nr-md-quota-bar{background:var(--nr-subtle);border:1px solid var(--nr-border-soft);border-radius:999px;height:12px;overflow:hidden;margin:.55rem 0}',
 	'.nr-md-table{width:100%;border-collapse:collapse;font-size:.85rem}',
 	'.nr-md-table th{text-align:left;padding:.5rem .6rem;border-bottom:1.5px solid var(--nr-border);color:var(--nr-muted);font-weight:600}',
@@ -65,6 +66,8 @@ function ensureStyle() {
 }
 
 var slotNames = {
+	internal: '内置 SIM',
+	external: '外置 SIM',
 	sim1: '外置 SIM1',
 	sim2: '外置 SIM2',
 	esim: '内置 eSIM',
@@ -347,6 +350,89 @@ return view.extend({
 	lastSnapshot: null,
 	maskIds: true,
 	cells: {},
+	simRequestPending: false,
+	simSwitchPending: null,
+	simSwitchError: '',
+	simSwitchCompleted: null,
+
+	updateSimSwitch: function(st, fromPoll) {
+		if (!this.simButtons) return;
+		var sim = st && st.sim || {}, state = sim.switch_state || 'idle';
+		if (fromPoll && !this.simRequestPending && this.simSwitchPending &&
+		    sim.switch_target === this.simSwitchPending && (state === 'done' || state === 'error'))
+			this.simSwitchPending = null;
+		var busy = this.simRequestPending || !!this.simSwitchPending || state === 'switching';
+		if (fromPoll && this.simSwitchCompleted && sim.slot && sim.slot !== this.simSwitchCompleted)
+			this.simSwitchCompleted = null;
+		var fresh = st && st.transport !== 'usb' && st.present && st.enabled !== '0' && st.source !== 'none' &&
+			!(num(st.stamp_age) > Math.max(60, (num(st.check_interval) || 30) * 2));
+		var target = this.simSwitchPending || this.simSwitchCompleted || sim.switch_target;
+		var error = this.simSwitchError || (state === 'error' ? sim.switch_error : '');
+		var self = this;
+		Object.keys(this.simButtons).forEach(function(slot) {
+			self.simButtons[slot].disabled = busy || !fresh || sim.slot === slot;
+			self.simButtons[slot].setAttribute('aria-pressed', sim.slot === slot ? 'true' : 'false');
+		});
+		if (this.simRequestPending)
+			this.simSwitchStatus.textContent = '正在提交 SIM 切换请求…';
+		else if (busy)
+			this.simSwitchStatus.textContent = '正在切换至%s，5G 上行会暂时中断，请等待模组重新注册。'.format(slotNames[target] || '目标 SIM');
+		else if (error)
+			this.simSwitchStatus.textContent = '切换失败：%s。请检查当前状态后重试。'.format(String(error).slice(0, 200));
+		else if (state === 'done' || this.simSwitchCompleted)
+			this.simSwitchStatus.textContent = '已确认使用%s；是否已联网，请查看蜂窝注册与 WAN 连接状态。'.format(slotNames[target] || '当前 SIM');
+		else if (!fresh)
+			this.simSwitchStatus.textContent = '当前 SIM 状态暂不可用；恢复状态采样后可切换卡槽。';
+		else
+			this.simSwitchStatus.textContent = '切换 SIM 会短暂中断 5G 上行，LAN 管理仍可访问。';
+		this.simSwitchStatus.style.color = error && !busy ? 'var(--nr-err)' : '';
+	},
+
+	handleSimSwitch: function(target) {
+		if (!this.simButtons || !this.simButtons[target] || this.simButtons[target].disabled) return;
+		ui.showModal('切换至%s？'.format(slotNames[target]), [
+			E('p', {}, '5G 上行会暂时中断，通常需要约 1 分钟重新注册。期间可继续通过 LAN 管理路由器。'),
+			E('p', {}, '两个系统使用同一个物理模组，切换系统后也会看到当前 SIM；两套系统的配置文件仍各自独立。'),
+			E('div', { 'class': 'right' }, [
+				E('button', { 'type': 'button', 'class': 'btn', 'click': ui.hideModal }, '取消'), ' ',
+				E('button', {
+					'type': 'button', 'class': 'btn cbi-button cbi-button-apply',
+					'click': ui.createHandlerFn(this, 'doSimSwitch', target)
+				}, '确认切换至%s'.format(slotNames[target]))
+			])
+		]);
+	},
+
+	doSimSwitch: function(target) {
+		if (!this.simButtons || !this.simButtons[target] || this.simButtons[target].disabled) return Promise.resolve();
+		this.simRequestPending = true;
+		this.simSwitchPending = target;
+		this.simSwitchError = '';
+		this.simSwitchCompleted = null;
+		ui.hideModal();
+		this.updateSimSwitch(this.lastSnapshot);
+		return Promise.resolve(this.refreshing).then(function() {
+			return fs.exec('/usr/sbin/mt5700-sim', [ target ]);
+		}).then(L.bind(function(res) {
+			if (res.code !== 0) throw new Error(res.stderr || '模组未接受切换请求');
+			var result = JSON.parse(res.stdout);
+			if (result.target !== target) throw new Error('切换响应的目标卡槽不一致');
+			if (result.started === true && result.state === 'switching') return;
+			if (result.started === false && result.state === 'done') {
+				this.simSwitchPending = null;
+				this.simSwitchCompleted = target;
+				return;
+			}
+			throw new Error('无法确认切换请求是否已启动');
+		}, this)).catch(L.bind(function(e) {
+			this.simSwitchPending = null;
+			this.simSwitchError = e.message;
+		}, this)).finally(L.bind(function() {
+			this.simRequestPending = false;
+			this.updateSimSwitch(this.lastSnapshot);
+			return this.refreshStatus();
+		}, this));
+	},
 
 	kvBlock: function(rows) {
 		var box = E('div');
@@ -375,14 +461,28 @@ return view.extend({
 			var li = E('li', {
 				'class': 'nr-md-tab' + (i === 0 ? ' active' : ''),
 				'role': 'tab',
+				'id': 'nr-modem-tab-' + t[0],
+				'aria-controls': 'nr-modem-panel-' + t[0],
+				'tabindex': i === 0 ? '0' : '-1',
 				'aria-selected': i === 0 ? 'true' : 'false',
+				'keydown': function(ev) {
+					var next;
+					if (ev.key === 'ArrowRight') next = li.nextElementSibling || bar.firstElementChild;
+					else if (ev.key === 'ArrowLeft') next = li.previousElementSibling || bar.lastElementChild;
+					else if (ev.key === 'Home') next = bar.firstElementChild;
+					else if (ev.key === 'End') next = bar.lastElementChild;
+					else if (ev.key === 'Enter' || ev.key === ' ') next = li;
+					if (next) { ev.preventDefault(); next.click(); next.focus(); }
+				},
 				'click': function() {
 					bar.querySelectorAll('li').forEach(function(el) {
 						el.classList.remove('active');
 						el.setAttribute('aria-selected', 'false');
+						el.setAttribute('tabindex', '-1');
 					});
 					li.classList.add('active');
 					li.setAttribute('aria-selected', 'true');
+					li.setAttribute('tabindex', '0');
 					Object.keys(bodies).forEach(function(k) { bodies[k].style.display = 'none'; });
 					bodies[t[0]].style.display = '';
 					if (t[0] === 'traffic') {
@@ -392,7 +492,11 @@ return view.extend({
 				}
 			}, t[1]);
 			bar.appendChild(li);
-			bodies[t[0]] = E('div', { 'style': (i === 0 ? '' : 'display:none;') });
+			bodies[t[0]] = E('div', {
+				'id': 'nr-modem-panel-' + t[0], 'role': 'tabpanel',
+				'aria-labelledby': 'nr-modem-tab-' + t[0],
+				'style': (i === 0 ? '' : 'display:none;')
+			});
 		});
 
 		this.tabBodies = bodies;
@@ -436,7 +540,7 @@ return view.extend({
 	resetKpisOnFailure: function() {
 		if (!this.kpi) return;
 		this.alertBanner.style.display = 'none';
-		this.kpi.netPill.textContent = '离线';
+		this.kpi.netPill.textContent = '状态未知';
 		this.kpi.netPill.className = 'nr-md-pill muted';
 		this.kpi.netVal.textContent = '—';
 		this.kpi.netSub.textContent = '暂时无法获取状态';
@@ -467,14 +571,17 @@ return view.extend({
 		st.signal = st.signal || {};
 		st.wwan = st.wwan || {};
 		this.lastSnapshot = st;
+		this.updateSimSwitch(st, true);
 
-		var interval = num(st.check_interval) || 30,
+		var ethernet = st.transport !== 'usb',
+		    interval = num(st.check_interval) || 30,
 		    staleAfter = Math.max(60, interval * 2),
 		    age = num(st.stamp_age),
 		    stale = (age !== null && age > staleAfter),
 		    noData = (st.source === 'none'),
 		    phase = st.sim.phase || '',
-		    switching = (st.sim.transition === 1 || noData || phase == 'switching'),
+		    switching = (st.sim.transition === 1 || noData || phase == 'switching' ||
+			st.sim.switch_state === 'switching' || !!this.simSwitchPending),
 		    absent = (phase == 'absent'),
 		    disabled = (st.enabled === '0'),
 		    tempNum = (!stale && !switching) ? num(st.temp_dc) : null,
@@ -484,29 +591,50 @@ return view.extend({
 		/* Contextual alert banner */
 		var bannerMsg = '', bannerCls = '';
 		if (disabled) {
-			bannerMsg = '蜂窝功能当前已关闭，可在「设置」选项卡中重新启用。';
+			bannerMsg = ethernet
+				? '状态采样已关闭，WAN 联网不受影响。可在「设置」中重新启用采样。'
+				: '蜂窝功能当前已关闭，可在「设置」选项卡中重新启用。';
 			bannerCls = 'nr-md-banner muted';
 		}
-		else if (!st.present) {
-			bannerMsg = '未检测到 MT5700M-CN 模组（USB 3466:3301 离线），请检查硬件状态。';
+		else if (ethernet && (st.sim.switch_state === 'switching' || this.simSwitchPending)) {
+			bannerMsg = 'SIM 正在切换，5G 上行暂时中断属正常过程，请等待模组重新注册。';
+			bannerCls = 'nr-md-banner muted';
+		}
+		else if (ethernet && num(st.carrier_link) === 0) {
+			bannerMsg = 'WAN 网口链路已断开，请检查模组供电和网线连接。';
 			bannerCls = 'nr-md-banner err';
 		}
-		else if (num(st.traffic.over_limit) === 1) {
+		else if (!st.present) {
+			bannerMsg = ethernet
+				? '模组 AT 状态接口暂未响应，将在下个采样周期重试。WAN 连接状态请查看下方。'
+				: '未检测到 MT5700M-CN 模组（USB 3466:3301 离线），请检查硬件状态。';
+			bannerCls = ethernet ? 'nr-md-banner warn' : 'nr-md-banner err';
+		}
+		else if (ethernet && st.sample_error) {
+			bannerMsg = '最近一次状态采样失败，当前显示 %d 秒前的数据：%s'.format(
+				Math.max(0, age || 0), String(st.sample_error).slice(0, 160));
+			bannerCls = 'nr-md-banner warn';
+		}
+		else if (!ethernet && num(st.traffic.over_limit) === 1) {
 			bannerMsg = (st.traffic.action == 'offline')
 				? '本月流量已超出设定限额，守护进程已按保护策略断开蜂窝连接。'
 				: '提醒：本月蜂窝流量已超出设定限额（当前为仅提醒模式）。';
 			bannerCls = (st.traffic.action == 'offline') ? 'nr-md-banner err' : 'nr-md-banner warn';
 		}
 		else if (st.cfun === '0') {
-			bannerMsg = '模组射频当前处于关闭状态（CFUN=0），等待后台守护进程恢复。';
+			bannerMsg = ethernet
+				? '模组上报射频已关闭（CFUN=0），请在模组管理端检查射频设置。'
+				: '模组射频当前处于关闭状态（CFUN=0），等待后台守护进程恢复。';
 			bannerCls = 'nr-md-banner warn';
 		}
-		else if (st.usb_speed === '480') {
+		else if (!ethernet && st.usb_speed === '480') {
 			bannerMsg = '提示：模组当前以 USB 2.0 (480 Mbps) 枚举，若已开启 USB 3.0 自动重训练将在后台自动恢复 5000 Mbps。';
 			bannerCls = 'nr-md-banner warn';
 		}
 		else if (tempNum !== null && tempNum >= 720) {
-			bannerMsg = '模组芯片温度达 %.1f °C，已触发联动散热加速。'.format(tempNum / 10);
+			bannerMsg = (ethernet
+				? '模组芯片温度达 %.1f °C，请检查设备通风。'
+				: '模组芯片温度达 %.1f °C，已触发联动散热加速。').format(tempNum / 10);
 			bannerCls = (tempNum >= 900) ? 'nr-md-banner err' : 'nr-md-banner warn';
 		}
 
@@ -520,7 +648,17 @@ return view.extend({
 		}
 
 		/* Hardware & SIM overview fields */
-		if (disabled) {
+		if (ethernet) {
+			C.modem.replaceChildren(
+				E('span', { 'style': 'font-weight:600;margin-right:.45rem;' },
+					disabled ? '状态采样已关闭' : (st.present ? 'MT5700M-CN 状态已获取' : 'AT 状态未响应')),
+				E('span', { 'class': 'nr-md-pill muted nr-md-mono' },
+					st.link_speed ? '以太网 %s Mbps'.format(st.link_speed) : '以太网桥接'),
+				E('div', { 'style': 'font-size:.78rem;color:var(--nr-muted);margin-top:.2rem;', 'class': 'nr-md-mono' },
+					'AT 接口 %s · 网卡 %s'.format(st.at_port || '—', st.netdev || 'wan'))
+			);
+		}
+		else if (disabled) {
 			C.modem.textContent = '蜂窝功能已关闭（可在下方启用）';
 		}
 		else if (!st.present) {
@@ -536,7 +674,10 @@ return view.extend({
 			);
 		}
 
-		var slot = (st.sim.slot) ? (slotNames[st.sim.slot] || st.sim.slot) : '—';
+		var knownEthernetSlot = st.sim.slot === 'internal' || st.sim.slot === 'external';
+		var slot = ethernet
+			? (knownEthernetSlot ? slotNames[st.sim.slot] : '当前 SIM 状态')
+			: ((st.sim.slot) ? (slotNames[st.sim.slot] || st.sim.slot) : '—');
 		var cfgslot = (st.sim.configured_slot)
 			? (slotNames[st.sim.configured_slot] || st.sim.configured_slot) : '—';
 
@@ -550,7 +691,9 @@ return view.extend({
 			K.bandPill.textContent = '—';
 			K.bandPill.className = 'nr-md-pill muted';
 			K.sigVal.replaceChildren('—');
-			K.sigSub.textContent = disabled ? '蜂窝已停用' : '模组不在线';
+			K.sigSub.textContent = ethernet
+				? (disabled ? '状态采样已关闭' : 'AT 状态未响应')
+				: (disabled ? '蜂窝已停用' : '模组不在线');
 			K.usbPill.textContent = disabled ? '已停用' : '离线';
 			K.usbPill.className = 'nr-md-pill muted';
 			K.simVal.textContent = slot;
@@ -563,7 +706,14 @@ return view.extend({
 			K.usbPill.className = (num(st.usb_speed) >= 5000) ? 'nr-md-pill ok nr-md-mono' : 'nr-md-pill warn nr-md-mono';
 			K.simVal.textContent = slot;
 
-			if (switching || stale) {
+			if (ethernet) {
+				C.sim.textContent = (switching || stale)
+					? '等待 SIM 状态采样'
+					: (knownEthernetSlot
+						? '%s · 当前卡槽：%s'.format(st.sim.state_cn || st.sim.state || '未上报', slot)
+						: '当前 SIM 状态：%s'.format(st.sim.state_cn || st.sim.state || '未上报'));
+			}
+			else if (switching || stale) {
 				C.sim.textContent = '正在检测 SIM 卡…（当前：%s，配置：%s）'.format(slot, cfgslot);
 				K.simSub.textContent = '正在检测… · 配置：%s'.format(cfgslot);
 			}
@@ -580,7 +730,8 @@ return view.extend({
 				C.sim.textContent = simTxt;
 				K.simSub.textContent = '%s · 配置：%s'.format(st.sim.state_cn || '已就绪', cfgslot);
 			}
-			C.sim.title = 'SCICHG=%s，cpe-sel0=%s'.format(st.sim.scichg || '—', st.sim.slot_gpio || '—');
+			C.sim.title = ethernet ? ''
+				: 'SCICHG=%s，cpe-sel0=%s'.format(st.sim.scichg || '—', st.sim.slot_gpio || '—');
 
 			this.renderIdentityFields(st, absent || switching || stale);
 
@@ -648,11 +799,11 @@ return view.extend({
 					K.tempPill.className = 'nr-md-pill err';
 				}
 				else if (tempNum >= 720) {
-					K.tempPill.textContent = '风扇联动';
+					K.tempPill.textContent = ethernet ? '温度偏高' : '风扇联动';
 					K.tempPill.className = 'nr-md-pill warn';
 				}
 				else {
-					K.tempPill.textContent = '散热正常';
+					K.tempPill.textContent = ethernet ? '温度正常' : '散热正常';
 					K.tempPill.className = 'nr-md-pill ok';
 				}
 			}
@@ -662,30 +813,45 @@ return view.extend({
 				K.tempPill.className = 'nr-md-pill muted';
 			}
 		}
+		if (ethernet) {
+			K.usbPill.textContent = num(st.carrier_link) === 0 ? 'WAN 断线'
+				: (st.link_speed ? '%s Mbps'.format(st.link_speed) : '以太网');
+			K.usbPill.className = num(st.carrier_link) === 0 ? 'nr-md-pill warn' : 'nr-md-pill muted nr-md-mono';
+			K.simSub.textContent = disabled ? '状态采样已关闭' : (!st.present ? 'AT 状态未响应'
+				: ((switching || stale) ? '等待状态采样' : (st.sim.state_cn || st.sim.state || '未上报')));
+		}
 
 		/* WWAN & KPI 1 */
 		var wwanNodes = E('div', { 'style': 'display:flex;flex-direction:column;gap:.3rem;' });
 		var wwanTop = E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;' });
-		var isConnected = !!(st.wwan.up && (st.wwan.ip4 || st.wwan.ip6));
+		var isConnected = !!(st.wwan.up && (st.wwan.ip4 || st.wwan.ip6)
+			&& !(ethernet && num(st.carrier_link) === 0));
 
 		if (isConnected) {
 			wwanTop.appendChild(E('span', { 'class': 'nr-md-pill ok' }, '已连接'));
-			K.netPill.textContent = '已连接';
+			K.netPill.textContent = ethernet ? 'WAN 已连接' : '已连接';
 			K.netPill.className = 'nr-md-pill ok';
 			if (num(st.carrier_link) === 0)
 				wwanTop.appendChild(E('span', { 'class': 'nr-md-pill warn' }, '链路重建中'));
 		}
+		else if (ethernet && num(st.carrier_link) === 0) {
+			wwanTop.appendChild(E('span', { 'class': 'nr-md-pill warn' }, 'WAN 网口断线'));
+			K.netPill.textContent = 'WAN 断线';
+			K.netPill.className = 'nr-md-pill warn';
+		}
 		else if (st.wwan.pending || st.wwan.up) {
-			wwanTop.appendChild(E('span', { 'class': 'nr-md-pill primary' }, st.wwan.up ? '连接建立中（待获取 IP）' : '正在拨号…'));
-			K.netPill.textContent = '拨号中';
+			wwanTop.appendChild(E('span', { 'class': 'nr-md-pill primary' }, ethernet
+				? 'WAN 等待获取 IP（DHCP）' : (st.wwan.up ? '连接建立中（待获取 IP）' : '正在拨号…')));
+			K.netPill.textContent = ethernet ? 'WAN 等待 IP' : '拨号中';
 			K.netPill.className = 'nr-md-pill primary';
 		}
 		else {
 			wwanTop.appendChild(E('span', { 'class': 'nr-md-pill muted' }, '未连接'));
-			K.netPill.textContent = disabled ? '已关闭' : '未连接';
+			K.netPill.textContent = ethernet ? 'WAN 未连接' : (disabled ? '已关闭' : '未连接');
 			K.netPill.className = 'nr-md-pill muted';
 		}
-		wwanTop.appendChild(E('span', { 'class': 'nr-md-pill muted nr-md-mono' }, 'APN: %s'.format(st.apn || '自动')));
+		wwanTop.appendChild(E('span', { 'class': 'nr-md-pill muted nr-md-mono' }, ethernet
+			? '5G 桥接上行（PoE）' : 'APN: %s'.format(st.apn || '自动')));
 		wwanNodes.appendChild(wwanTop);
 
 		if (st.wwan.ip4) {
@@ -710,11 +876,13 @@ return view.extend({
 		var ratShort = (!stale && !switching && !absent && st.signal.sysmode && st.signal.sysmode !== 'NOSERVICE')
 			? (sysmodeNames[st.signal.sysmode] || st.signal.sysmode)
 			: '';
-		K.netVal.textContent = disabled ? '蜂窝已停用'
-			: (!st.present ? '模组离线'
+		K.netVal.textContent = disabled ? (ethernet ? '状态采样已关闭' : '蜂窝已停用')
+			: (!st.present ? (ethernet ? 'AT 状态未响应' : '模组离线')
 			: (operName && ratShort && operName !== ratShort ? '%s · %s'.format(operName, ratShort)
 			: (operName || ratShort || (switching ? '正在检测…' : '等待驻留'))));
-		K.netSub.textContent = isConnected
+		K.netSub.textContent = ethernet
+			? (isConnected ? 'WAN 已连接 %s'.format(fmtUptime(st.traffic.uptime)) : 'WAN 未连接')
+			: isConnected
 			? '在线 %s · APN %s'.format(fmtUptime(st.traffic.uptime), st.apn || '自动')
 			: 'APN：%s'.format(st.apn || '自动');
 
@@ -722,7 +890,8 @@ return view.extend({
 
 		var limitMb = num(st.traffic.limit_mb),
 		    monUsedB = (num(st.traffic.mon_rx) || 0) + (num(st.traffic.mon_tx) || 0);
-		K.tempSub.textContent = (limitMb && limitMb > 0)
+		K.tempSub.textContent = ethernet ? '模组内部温度'
+			: (limitMb && limitMb > 0)
 			? '本月流量：%s / %s'.format(fmtBytes(monUsedB), fmtBytes(limitMb * 1048576))
 			: '本月流量：%s'.format(fmtBytes(monUsedB));
 
@@ -731,7 +900,9 @@ return view.extend({
 			meta.push('AT 通道忙');
 		if (stale)
 			meta.push('数据已过期（%d 秒前）'.format(age));
-		if (noData) meta.push('等待后台采集 · 10s 自动刷新');
+		if (ethernet && st.sample_error) meta.push('最近采样失败');
+		if (ethernet && disabled) meta.push('状态采样已关闭 · 10s 自动刷新 WAN');
+		else if (noData) meta.push('等待后台采集 · 10s 自动刷新');
 		else meta.push('快照 %d 秒前 · 10s 自动刷新'.format(Math.max(0, age || 0)));
 		C.meta.textContent = meta.join(' ｜ ');
 
@@ -748,9 +919,10 @@ return view.extend({
 		var C = this.cells, raw = (st.cell && st.cell.raw) || '', rat = (st.cell && st.cell.rat) || '';
 
 		if (switching || stale) {
-			C.cellrat.textContent = '检测中…';
+			C.cellrat.textContent = st.transport !== 'usb' ? '暂无新鲜数据' : '检测中…';
 			this.rfGaugesBox.replaceChildren();
-			C.celltable.replaceChildren();
+			C.celltable.replaceChildren(E('p', { 'class': 'nr-md-note' }, st.transport !== 'usb'
+				? '等待新的模组状态采样。' : '等待模组上报小区参数。'));
 			return;
 		}
 
@@ -854,8 +1026,9 @@ return view.extend({
 		var C = this.cells;
 
 		if (switching || stale || absent) {
-			C.qci.textContent = '检测中…';
-			C.qcitable.replaceChildren(E('p', { 'class': 'nr-md-note' }, '等待网络协商参数…'));
+			C.qci.textContent = st.transport !== 'usb' ? '暂无新鲜数据' : '检测中…';
+			C.qcitable.replaceChildren(E('p', { 'class': 'nr-md-note' }, st.transport !== 'usb'
+				? '等待新的模组状态采样。' : '等待网络协商参数…'));
 			C.ambrdl.textContent = '—';
 			C.ambrul.textContent = '—';
 			C.apnsub.textContent = '—';
@@ -921,7 +1094,7 @@ return view.extend({
 	},
 
 	updateTrafficTab: function(st) {
-		var C = this.cells, tr = st.traffic || {};
+		var C = this.cells, tr = st.traffic || {}, ethernet = st.transport !== 'usb';
 		var sessRx = (tr.sess_rx !== undefined) ? tr.sess_rx : tr.live_rx,
 		    sessTx = (tr.sess_tx !== undefined) ? tr.sess_tx : tr.live_tx,
 		    dayRx = num(tr.day_rx) || 0, dayTx = num(tr.day_tx) || 0,
@@ -937,46 +1110,60 @@ return view.extend({
 			);
 		}
 
-		fillRow(C.sess, '本次连接（%s）'.format(fmtUptime(tr.uptime)), sessRx, sessTx, (Number(sessRx) || 0) + (Number(sessTx) || 0));
-		fillRow(C.day, '今日统计', dayRx, dayTx, dayRx + dayTx);
-		fillRow(C.mon, '本月账期', monRx, monTx, monRx + monTx);
-		fillRow(C.tot, '历史累计', totRx, totTx, totRx + totTx);
-
-		/* quota / billing-period display */
-		var limit = num(tr.limit_mb),
-		    resetDay = num(tr.reset_day) || 1,
-		    monUsed = monRx + monTx;
-		this.quotaResetPill.textContent = '每月 %d 日重置'.format(resetDay);
-		this.quotaPolicyPill.textContent = (tr.action == 'offline') ? '策略：超限断开蜂窝' : '策略：超限仅提醒';
-		this.quotaPolicyPill.className = (tr.action == 'offline') ? 'nr-md-pill warn' : 'nr-md-pill muted';
-
-		if (limit !== null && limit > 0) {
-			var limitB = limit * 1048576,
-			    pct = Math.min(999, Math.round(monUsed / limitB * 100)),
-			    over = (num(tr.over_limit) === 1),
-			    color = over ? '#d9534f' : (pct >= 80 ? '#f0ad4e' : '#2eb872'),
-			    remainB = Math.max(0, limitB - monUsed);
-			this.quotaFill.style.width = Math.min(100, pct) + '%';
-			this.quotaFill.style.background = color;
-			var qText = '已用 %s / %s（%d%%）'.format(fmtBytes(monUsed), fmtBytes(limitB), pct);
-			var rText = over
-				? ((tr.action == 'offline') ? '⚠ 已超限，蜂窝已断开' : '⚠ 已超限（提醒模式）')
-				: '剩余可用 %s'.format(fmtBytes(remainB));
-			C.quota.replaceChildren(
-				E('span', { 'style': 'font-weight:600;' }, qText),
-				E('span', { 'style': over ? 'color:var(--nr-err);font-weight:600;' : 'color:var(--nr-muted);' }, rText)
-			);
-			C.quota.title = 'billing period ' + (tr.period_key || '');
+		if (ethernet) {
+			if (num(tr.live_rx) !== null && num(tr.live_tx) !== null)
+				fillRow(C.sess, 'WAN 接口当前计数', tr.live_rx, tr.live_tx, Number(tr.live_rx) + Number(tr.live_tx));
+			else
+				C.sess.replaceChildren(E('td', {}, 'WAN 接口当前计数'), E('td', {}, '—'), E('td', {}, '—'), E('td', {}, '—'));
 		}
 		else {
-			C.quota.replaceChildren(
-				E('span', { 'style': 'color:var(--nr-muted);' }, '未设置月度限额（可在「设置 → 流量限额」中配置配额与重置日）'),
-				E('span', { 'class': 'nr-md-mono' }, '本月已用 %s'.format(fmtBytes(monUsed)))
-			);
-			this.quotaFill.style.width = '0%';
+			fillRow(C.sess, '本次连接（%s）'.format(fmtUptime(tr.uptime)), sessRx, sessTx, (Number(sessRx) || 0) + (Number(sessTx) || 0));
+			fillRow(C.day, '今日统计', dayRx, dayTx, dayRx + dayTx);
+			fillRow(C.mon, '本月账期', monRx, monTx, monRx + monTx);
+			fillRow(C.tot, '历史累计', totRx, totTx, totRx + totTx);
+
+			/* quota / billing-period display */
+			var limit = num(tr.limit_mb),
+			    resetDay = num(tr.reset_day) || 1,
+			    monUsed = monRx + monTx;
+			this.quotaResetPill.textContent = '每月 %d 日重置'.format(resetDay);
+			this.quotaPolicyPill.textContent = (tr.action == 'offline') ? '策略：超限断开蜂窝' : '策略：超限仅提醒';
+			this.quotaPolicyPill.className = (tr.action == 'offline') ? 'nr-md-pill warn' : 'nr-md-pill muted';
+
+			if (limit !== null && limit > 0) {
+				var limitB = limit * 1048576,
+				    pct = Math.min(999, Math.round(monUsed / limitB * 100)),
+				    over = (num(tr.over_limit) === 1),
+				    color = over ? '#d9534f' : (pct >= 80 ? '#f0ad4e' : '#2eb872'),
+				    remainB = Math.max(0, limitB - monUsed);
+				this.quotaFill.style.width = Math.min(100, pct) + '%';
+				this.quotaFill.style.background = color;
+				var qText = '已用 %s / %s（%d%%）'.format(fmtBytes(monUsed), fmtBytes(limitB), pct);
+				var rText = over
+					? ((tr.action == 'offline') ? '⚠ 已超限，蜂窝已断开' : '⚠ 已超限（提醒模式）')
+					: '剩余可用 %s'.format(fmtBytes(remainB));
+				C.quota.replaceChildren(
+					E('span', { 'style': 'font-weight:600;' }, qText),
+					E('span', { 'style': over ? 'color:var(--nr-err);font-weight:600;' : 'color:var(--nr-muted);' }, rText)
+				);
+				C.quota.title = 'billing period ' + (tr.period_key || '');
+			}
+			else {
+				C.quota.replaceChildren(
+					E('span', { 'style': 'color:var(--nr-muted);' }, '未设置月度限额（可在「设置 → 流量限额」中配置配额与重置日）'),
+					E('span', { 'class': 'nr-md-mono' }, '本月已用 %s'.format(fmtBytes(monUsed)))
+				);
+				this.quotaFill.style.width = '0%';
+			}
 		}
 
 		/* client-side rate from consecutive live counter samples */
+		if (ethernet && (num(tr.live_rx) === null || num(tr.live_tx) === null)) {
+			this.lastTraffic = null;
+			C.raterx.textContent = '等待采样';
+			C.ratetx.textContent = '等待采样';
+			return;
+		}
 		var now = Date.now();
 		if (this.lastTraffic && tr.live_rx !== undefined) {
 			var dt = (now - this.lastTraffic.t) / 1000;
@@ -995,6 +1182,7 @@ return view.extend({
 	},
 
 	handleTrafficReset: function(scope) {
+		if (this.ethernet) return;
 		ui.showModal('清零流量统计', [
 			E('p', {}, scope == 'day' ? '确认将「今日」流量统计清零？' : scope == 'month' ? '确认将「本月」（含今日）流量统计清零？' : '确认将全部流量统计清零？'),
 			E('div', { 'class': 'right' }, [
@@ -1022,6 +1210,7 @@ return view.extend({
 		catch (e) {
 			// Never leave a previous "connected" verdict after a failed poll.
 			this.lastSnapshot = null;
+			this.updateSimSwitch(null);
 			this.resetKpisOnFailure();
 			var cells = this.cells;
 			Object.keys(cells).forEach(function(key) {
@@ -1046,9 +1235,22 @@ return view.extend({
 
 	refreshStatus: function() {
 		if (this.refreshing) return this.refreshing;
+		if (this.simRequestPending) return Promise.resolve();
+		if (this.refreshButton) {
+			this.refreshButton.textContent = '刷新中…';
+			this.refreshButton.disabled = true;
+			this.refreshButton.setAttribute('aria-busy', 'true');
+		}
 		this.refreshing = fs.exec('/usr/sbin/mt5700-status').then(L.bind(this.applyStatus, this))
 			.catch(L.bind(function(e) { this.applyStatus({ error: e.message }); }, this))
-			.finally(L.bind(function() { this.refreshing = null; }, this));
+			.finally(L.bind(function() {
+				this.refreshing = null;
+				if (this.refreshButton) {
+					this.refreshButton.textContent = '刷新状态';
+					this.refreshButton.disabled = false;
+					this.refreshButton.setAttribute('aria-busy', 'false');
+				}
+			}, this));
 		return this.refreshing;
 	},
 
@@ -1056,6 +1258,14 @@ return view.extend({
 		ensureStyle();
 		this.cells = {};
 		var self = this;
+		// Unknown transport must not expose modem power/configuration controls.
+		var ethernet = true;
+		try {
+			if (!first.error && first.code === 0) ethernet = JSON.parse(first.stdout).transport !== 'usb';
+		}
+		catch (e) { /* Keep the conservative read-only form until reload. */ }
+		this.ethernet = ethernet;
+		this.simButtons = null;
 
 		['modem', 'sim', 'imsi', 'reg', 'sig', 'wwan', 'temp', 'meta', 'imei', 'uptime',
 		 'cellrat', 'qci', 'pdp4', 'pdp6', 'cids', 'ndis', 'syscfg', 'nwtime',
@@ -1073,8 +1283,8 @@ return view.extend({
 		});
 
 		var C = this.cells;
-		C.raterx.textContent = '↓ 0 B/s';
-		C.ratetx.textContent = '↑ 0 B/s';
+		C.raterx.textContent = ethernet ? '等待采样' : '↓ 0 B/s';
+		C.ratetx.textContent = ethernet ? '等待采样' : '↑ 0 B/s';
 
 		this.alertBanner = E('div', { 'class': 'nr-md-banner', 'style': 'display:none;' });
 
@@ -1095,7 +1305,7 @@ return view.extend({
 		var K = this.kpi;
 		var kpiGrid = E('div', { 'class': 'nr-md-kpis' }, [
 			E('div', { 'class': 'nr-md-kpi' }, [
-				E('div', { 'class': 'nr-md-kpi-top' }, [ E('span', {}, '驻留网络'), K.netPill ]),
+				E('div', { 'class': 'nr-md-kpi-top' }, [ E('span', {}, ethernet ? '蜂窝注册' : '驻留网络'), K.netPill ]),
 				K.netVal,
 				K.netSub
 			]),
@@ -1105,7 +1315,7 @@ return view.extend({
 				K.sigSub
 			]),
 			E('div', { 'class': 'nr-md-kpi' }, [
-				E('div', { 'class': 'nr-md-kpi-top' }, [ E('span', {}, 'SIM 与总线'), K.usbPill ]),
+				E('div', { 'class': 'nr-md-kpi-top' }, [ E('span', {}, ethernet ? 'SIM 与网口' : 'SIM 与总线'), K.usbPill ]),
 				K.simVal,
 				K.simSub
 			]),
@@ -1118,10 +1328,24 @@ return view.extend({
 
 		this.canvasRx = E('canvas', { 'width': 360, 'height': 64, 'data-color': '#2eb872', 'style': 'width:100%;height:64px;display:block;' });
 		this.canvasTx = E('canvas', { 'width': 360, 'height': 64, 'data-color': '#4a90d9', 'style': 'width:100%;height:64px;display:block;' });
-		this.quotaFill = E('div', { 'style': 'height:100%;width:0;background:#2eb872;transition:width .4s,background .4s;border-radius:999px;' });
+		this.quotaFill = E('div', { 'style': 'height:100%;width:0;background:#2eb872;transition:background .4s;border-radius:999px;' });
 
 		var tabs = this.buildTabs();
 		var B = tabs.bodies;
+		var simControls = '';
+		if (ethernet) {
+			this.simButtons = {};
+			this.simSwitchStatus = E('p', { 'class': 'nr-md-note', 'id': 'mt5700_sim_switch', 'role': 'status', 'aria-live': 'polite' }, '正在读取 SIM 状态…');
+			var simActions = E('div', { 'style': 'display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.75rem;' });
+			['internal', 'external'].forEach(function(slot) {
+				self.simButtons[slot] = E('button', {
+					'type': 'button', 'class': 'cbi-button', 'disabled': 'disabled',
+					'click': function() { self.handleSimSwitch(slot); }
+				}, '使用%s'.format(slotNames[slot]));
+				simActions.appendChild(self.simButtons[slot]);
+			});
+			simControls = E('div', {}, [ simActions, this.simSwitchStatus ]);
+		}
 
 		/* --- Tab 1: Overview --- */
 		var maskBtn = E('button', {
@@ -1132,7 +1356,8 @@ return view.extend({
 				maskBtn.textContent = self.maskIds ? '显示完整标识' : '隐藏敏感标识';
 				if (self.lastSnapshot) {
 					var st = self.lastSnapshot;
-					var hide = !st.present || st.enabled === '0' || st.sim.phase === 'absent' || st.sim.transition === 1 || st.source === 'none';
+					var hide = !st.present || st.enabled === '0' || st.sim.phase === 'absent' || st.sim.transition === 1 || st.source === 'none'
+						|| num(st.stamp_age) > Math.max(60, (num(st.check_interval) || 30) * 2);
 					self.renderIdentityFields(st, hide);
 				}
 			}
@@ -1141,13 +1366,13 @@ return view.extend({
 		B.overview.appendChild(E('div', { 'class': 'nr-md-grid2' }, [
 			E('div', { 'class': 'nr-md-card' }, [
 				E('div', { 'class': 'nr-md-card-head' }, [
-					E('h3', { 'class': 'nr-md-card-title' }, '蜂窝拨号与网络注册')
+					E('h3', { 'class': 'nr-md-card-title' }, ethernet ? '5G 桥接上行与蜂窝注册' : '蜂窝拨号与网络注册')
 				]),
 				this.kvBlock([
-					['蜂窝连接 (wwan)', C.wwan],
+					[ethernet ? '5G / PoE 上行 (wan)' : '蜂窝连接 (wwan)', C.wwan],
 					['运营商 / 注册', C.reg],
 					['信号质量', C.sig],
-					['连接时长', C.uptime]
+					[ethernet ? 'WAN 连接时长' : '连接时长', C.uptime]
 				])
 			]),
 			E('div', { 'class': 'nr-md-card' }, [
@@ -1160,9 +1385,14 @@ return view.extend({
 					['SIM 卡槽', C.sim],
 					['IMSI / ICCID', C.imsi],
 					['模组 IMEI', C.imei]
-				])
+				]),
+				simControls
 			])
 		]));
+
+		if (ethernet)
+			B.overview.appendChild(E('p', { 'class': 'nr-md-note' },
+				'物理端口：1 个 5G/PoE 上行 + 3 个 LAN；IPv4 与 IPv6 共用同一上行口。'));
 
 		/* --- Tab 2: Cell & Signal --- */
 		this.rfGaugesBox = E('div', { 'class': 'nr-md-grid3' });
@@ -1225,17 +1455,19 @@ return view.extend({
 		/* --- Tab 4: Traffic --- */
 		this.quotaResetPill = E('span', { 'class': 'nr-md-pill muted' }, '每月 1 日重置');
 		this.quotaPolicyPill = E('span', { 'class': 'nr-md-pill muted' }, '策略：超限仅提醒');
-		B.traffic.appendChild(E('div', { 'class': 'nr-md-card', 'style': 'margin-bottom:1rem;' }, [
-			E('div', { 'class': 'nr-md-card-head', 'style': 'border-bottom:none;padding-bottom:0;margin-bottom:0;' }, [
-				E('div', { 'style': 'display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;' }, [
-					E('h3', { 'class': 'nr-md-card-title' }, '本月账期流量配额'),
-					this.quotaResetPill
+		if (!ethernet) {
+			B.traffic.appendChild(E('div', { 'class': 'nr-md-card', 'style': 'margin-bottom:1rem;' }, [
+				E('div', { 'class': 'nr-md-card-head', 'style': 'border-bottom:none;padding-bottom:0;margin-bottom:0;' }, [
+					E('div', { 'style': 'display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;' }, [
+						E('h3', { 'class': 'nr-md-card-title' }, '本月账期流量配额'),
+						this.quotaResetPill
+					]),
+					this.quotaPolicyPill
 				]),
-				this.quotaPolicyPill
-			]),
-			E('div', { 'class': 'nr-md-quota-bar' }, [ this.quotaFill ]),
-			C.quota
-		]));
+				E('div', { 'class': 'nr-md-quota-bar' }, [ this.quotaFill ]),
+				C.quota
+			]));
+		}
 
 		B.traffic.appendChild(E('div', { 'class': 'nr-md-grid2', 'style': 'margin-bottom:1rem;' }, [
 			E('div', { 'class': 'nr-md-card' }, [
@@ -1256,8 +1488,8 @@ return view.extend({
 
 		B.traffic.appendChild(E('div', { 'class': 'nr-md-card' }, [
 			E('div', { 'class': 'nr-md-card-head' }, [
-				E('h3', { 'class': 'nr-md-card-title' }, '分周期累计账单'),
-				E('div', { 'style': 'display:flex;gap:.4rem;flex-wrap:wrap;' }, [
+				E('h3', { 'class': 'nr-md-card-title' }, ethernet ? 'WAN 接口流量' : '分周期累计账单'),
+				ethernet ? '' : E('div', { 'style': 'display:flex;gap:.4rem;flex-wrap:wrap;' }, [
 					E('button', { 'class': 'cbi-button', 'style': 'padding:3px 10px;', 'click': ui.createHandlerFn(this, 'handleTrafficReset', 'day') }, '清零今日'),
 					E('button', { 'class': 'cbi-button', 'style': 'padding:3px 10px;', 'click': ui.createHandlerFn(this, 'handleTrafficReset', 'month') }, '清零本月'),
 					E('button', { 'class': 'cbi-button cbi-button-negative', 'style': 'padding:3px 10px;', 'click': ui.createHandlerFn(this, 'handleTrafficReset', 'all') }, '全部清零')
@@ -1267,85 +1499,96 @@ return view.extend({
 				E('table', { 'class': 'nr-md-table' }, [
 					E('thead', {}, [
 						E('tr', {}, [
-							E('th', {}, '统计周期'),
+							E('th', {}, ethernet ? '计数来源' : '统计周期'),
 							E('th', {}, '下行流量 ↓'),
 							E('th', {}, '上行流量 ↑'),
 							E('th', {}, '合计')
 						])
 					]),
-					E('tbody', {}, [ C.sess, C.day, C.mon, C.tot ])
+					E('tbody', {}, ethernet ? [ C.sess ] : [ C.sess, C.day, C.mon, C.tot ])
 				])
 			]),
-			E('p', { 'class': 'nr-md-note' }, '统计由 mt5700 守护进程每巡检周期从模组网卡计数器累计并持久化（重启不丢失），速率曲线在本页打开期间实时采样。')
+			E('p', { 'class': 'nr-md-note' }, ethernet
+				? '显示 WAN 网卡当前接收与发送计数，重启或接口重建后可能归零；不代表运营商账单。本页打开期间根据相邻计数计算速率。'
+				: '统计由 mt5700 守护进程每巡检周期从模组网卡计数器累计并持久化（重启不丢失），速率曲线在本页打开期间实时采样。')
 		]));
 
 		/* --- Tab 5: Settings form --- */
-		var m = new form.Map('mt5700', null,
-			'点击「保存并应用」后，后台将在下一个检查周期开始处理（默认 30 秒，检测或注册可能需要更长时间）。切换 SIM 卡、修改 APN 或网络模式会短暂中断蜂窝连接，可在总览查看进度。');
+		var m = new form.Map('mt5700', null, ethernet
+			? '本栏设置只控制状态采样。保存并应用后，采样开关和间隔将在下个检查周期生效；关闭采样不会断开 WAN、切断供电或修改模组配置。'
+			: '点击「保存并应用」后，后台将在下一个检查周期开始处理（默认 30 秒，检测或注册可能需要更长时间）。切换 SIM 卡、修改 APN 或网络模式会短暂中断蜂窝连接，可在总览查看进度。');
 		var s = m.section(form.NamedSection, 'modem', 'mt5700', '蜂窝设置');
 		s.tab('general', '常用设置');
-		s.tab('quota', '流量限额');
-		s.tab('advanced', '高级设置');
+		if (!ethernet) {
+			s.tab('quota', '流量限额');
+			s.tab('advanced', '高级设置');
+		}
 
-		var o = s.taboption('general', form.Flag, 'enabled', '启用 5G 蜂窝', '关闭后将切断模组供电并停止自动拨号。');
+		var o = s.taboption('general', form.Flag, 'enabled', ethernet ? '启用状态采样' : '启用 5G 蜂窝',
+			ethernet ? '定期读取 SIM、信号、注册和温度；WAN 连接状态始终可查看。' : '关闭后将切断模组供电并停止自动拨号。');
 		o.rmempty = false;
 		o.default = '1';
 
-		o = s.taboption('general', form.ListValue, 'sim_slot', 'SIM 卡槽', '「自动检测」按 外置 SIM1 → 外置 SIM2 → 内置 eSIM 顺序探测可用 SIM 卡。');
-		o.value('auto', slotNames.auto);
-		o.value('sim1', slotNames.sim1);
-		o.value('sim2', slotNames.sim2);
-		o.value('esim', slotNames.esim);
-		o.default = 'auto';
+		if (!ethernet) {
+			o = s.taboption('general', form.ListValue, 'sim_slot', 'SIM 卡槽', '「自动检测」按 外置 SIM1 → 外置 SIM2 → 内置 eSIM 顺序探测可用 SIM 卡。');
+			o.value('auto', slotNames.auto);
+			o.value('sim1', slotNames.sim1);
+			o.value('sim2', slotNames.sim2);
+			o.value('esim', slotNames.esim);
+			o.default = 'auto';
 
-		o = s.taboption('general', form.Value, 'apn', 'APN', '留空则按 IMSI 自动识别运营商并配置（移动 cmnet / 联通 3gnet / 电信 ctnet / 广电 cbnet）。');
-		o.placeholder = '自动（按运营商识别）';
-		o.datatype = 'maxlength(64)';
-		o.validate = function(section, value) {
-			return !value || /^[a-zA-Z0-9.-]+$/.test(value) || 'APN 只能包含字母、数字、点和连字符';
-		};
+			o = s.taboption('general', form.Value, 'apn', 'APN', '留空则按 IMSI 自动识别运营商并配置（移动 cmnet / 联通 3gnet / 电信 ctnet / 广电 cbnet）。');
+			o.placeholder = '自动（按运营商识别）';
+			o.datatype = 'maxlength(64)';
+			o.validate = function(section, value) {
+				return !value || /^[a-zA-Z0-9.-]+$/.test(value) || 'APN 只能包含字母、数字、点和连字符';
+			};
 
-		o = s.taboption('general', form.ListValue, 'netmode', '网络模式', '仅 5G / 仅 4G 通过 AT^SYSCFGEX 锁定制式，切换会触发网络重选。');
-		o.value('auto', '自动（5G 优先）');
-		o.value('nr', '仅 5G NR');
-		o.value('lte', '仅 LTE');
-		o.default = 'auto';
-		o.rmempty = false;
+			o = s.taboption('general', form.ListValue, 'netmode', '网络模式', '仅 5G / 仅 4G 通过 AT^SYSCFGEX 锁定制式，切换会触发网络重选。');
+			o.value('auto', '自动（5G 优先）');
+			o.value('nr', '仅 5G NR');
+			o.value('lte', '仅 LTE');
+			o.default = 'auto';
+			o.rmempty = false;
 
-		o = s.taboption('quota', form.Value, 'traffic_limit_mb', '月度限额（MB）', '留空或 0 表示不限。按下方「重置日」划分的账期统计（下行+上行合计）。');
-		o.placeholder = '不限';
-		o.datatype = 'and(uinteger,min(0))';
+			o = s.taboption('quota', form.Value, 'traffic_limit_mb', '月度限额（MB）', '留空或 0 表示不限。按下方「重置日」划分的账期统计（下行+上行合计）。');
+			o.placeholder = '不限';
+			o.datatype = 'and(uinteger,min(0))';
 
-		o = s.taboption('quota', form.Value, 'traffic_reset_day', '账期重置日（几号）', '每月第几号结转流量账目（1–31；短月自动按月末处理），默认 1 号。');
-		o.placeholder = '1';
-		o.default = '1';
-		o.rmempty = false;
-		o.datatype = 'and(uinteger,min(1),max(31))';
+			o = s.taboption('quota', form.Value, 'traffic_reset_day', '账期重置日（几号）', '每月第几号结转流量账目（1–31；短月自动按月末处理），默认 1 号。');
+			o.placeholder = '1';
+			o.default = '1';
+			o.rmempty = false;
+			o.datatype = 'and(uinteger,min(1),max(31))';
 
-		o = s.taboption('quota', form.ListValue, 'traffic_action', '超限动作', '「断开蜂窝」会在超限后断开并停止拨号，直到下个账期或调高/取消限额；「仅提醒」只在页面标红提示。');
-		o.value('notify', '仅提醒（页面标红）');
-		o.value('offline', '断开蜂窝（直至下个账期）');
-		o.default = 'notify';
-		o.rmempty = false;
+			o = s.taboption('quota', form.ListValue, 'traffic_action', '超限动作', '「断开蜂窝」会在超限后断开并停止拨号，直到下个账期或调高/取消限额；「仅提醒」只在页面标红提示。');
+			o.value('notify', '仅提醒（页面标红）');
+			o.value('offline', '断开蜂窝（直至下个账期）');
+			o.default = 'notify';
+			o.rmempty = false;
 
-		o = s.taboption('advanced', form.Flag, 'usb3_retrain', 'USB 3.0 自动重训练', '模组以 USB 2.0（480 Mbps）枚举时自动热重启并重训练至 USB 3.0（5000 Mbps）。');
-		o.rmempty = false;
-		o.default = '1';
+			o = s.taboption('advanced', form.Flag, 'usb3_retrain', 'USB 3.0 自动重训练', '模组以 USB 2.0（480 Mbps）枚举时自动热重启并重训练至 USB 3.0（5000 Mbps）。');
+			o.rmempty = false;
+			o.default = '1';
 
-		o = s.taboption('advanced', form.Flag, 'fix_nvram', '模组 NVRAM 自愈', '自动修复其他系统残留的异常配置（SETMODE / TDCFG 网卡模式、C5GOPTION 5G SA 锁死）。');
-		o.rmempty = false;
-		o.default = '1';
+			o = s.taboption('advanced', form.Flag, 'fix_nvram', '模组 NVRAM 自愈', '自动修复其他系统残留的异常配置（SETMODE / TDCFG 网卡模式、C5GOPTION 5G SA 锁死）。');
+			o.rmempty = false;
+			o.default = '1';
 
-		o = s.taboption('advanced', form.Flag, 'thermal_guard', '模组高温联动散热', '按 AT^CHIPTEMP 模组内部温度联动风扇加速（≥72 °C 起步），先于 97 °C 保护性断网。');
-		o.rmempty = false;
-		o.default = '1';
+			o = s.taboption('advanced', form.Flag, 'thermal_guard', '模组高温联动散热', '按 AT^CHIPTEMP 模组内部温度联动风扇加速（≥72 °C 起步），先于 97 °C 保护性断网。');
+			o.rmempty = false;
+			o.default = '1';
+		}
 
-		o = s.taboption('advanced', form.Value, 'check_interval', '检查间隔（秒）', '守护进程巡检 SIM / 注册 / 拨号 / 流量统计的周期。');
+		o = s.taboption(ethernet ? 'general' : 'advanced', form.Value, 'check_interval',
+			ethernet ? '采样间隔（秒）' : '检查间隔（秒）',
+			ethernet ? '后台读取模组状态的间隔；页面每 10 秒刷新已采集的结果。' : '守护进程巡检 SIM / 注册 / 拨号 / 流量统计的周期。');
 		o.placeholder = '30';
 		o.datatype = 'range(10, 600)';
 		o.rmempty = false;
 
-		var refreshBtn = E('button', {
+		this.refreshButton = E('button', {
+			'type': 'button',
 			'class': 'cbi-button',
 			'click': ui.createHandlerFn(this, 'refreshStatus')
 		}, '刷新状态');
@@ -1353,7 +1596,7 @@ return view.extend({
 		var container = E('div', { 'class': 'nr-md' }, [
 			E('div', { 'class': 'nr-md-head' }, [
 				E('h2', {}, '5G 蜂窝（MT5700M-CN）'),
-				E('div', { 'class': 'nr-md-head-right' }, [ C.meta, refreshBtn ])
+				E('div', { 'class': 'nr-md-head-right' }, [ C.meta, this.refreshButton ])
 			]),
 			this.alertBanner,
 			kpiGrid,

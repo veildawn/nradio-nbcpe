@@ -11,6 +11,40 @@ SOURCE = (ROOT / 'board/files/usr/sbin/mt5700-status').read_text()
 
 
 class ModemTests(unittest.TestCase):
+    def test_ethernet_dispatch_never_enters_usb_power_manager(self):
+        source = (ROOT / 'board/files/usr/sbin/mt5700-bringup').read_text()
+        source = source.replace('. /lib/functions.sh', '').replace('. /usr/share/libubox/jshn.sh', '')
+        with tempfile.TemporaryDirectory() as tmp:
+            helper = Path(tmp) / 'monitor'
+            helper.write_text('printf "ethernet %s\\n" "$1"\n')
+            source = source.replace('/usr/sbin/mt5700-ethernet', str(helper))
+            stubs = 'board_name() { echo nradio,nbcpe; }\nuci() { echo ethernet; }\n'
+            result = subprocess.run(['sh', '-c', stubs + source, 'manager', '--once'], capture_output=True, text=True, check=True)
+            self.assertEqual(result.stdout, 'ethernet --once\n')
+            self.assertEqual(result.stderr, '')
+
+    def test_ethernet_defaults_do_not_create_phantom_usb_interfaces(self):
+        source = (ROOT / 'board/files/etc/uci-defaults/99-nradio-nbcpe-wwan').read_text()
+        source = source.replace('. /lib/functions.sh', '')
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = Path(tmp) / 'uci-calls'
+            stubs = '''
+board_name() { echo nradio,nbcpe; }
+uci() {
+    case "$*" in
+    *'get mt5700.modem.transport') echo ethernet ;;
+    set*|commit*|add_list*) printf '%s\n' "$*" >> "$CALLS" ;;
+    *) return 1 ;;
+    esac
+}
+'''
+            subprocess.run(['sh', '-c', stubs + source], env=dict(os.environ, CALLS=str(calls)), check=True)
+            changes = calls.read_text()
+            self.assertIn('network.wan.label=', changes)
+            self.assertNotIn('wwan', changes)
+            self.assertNotIn('dhcp.', changes)
+            self.assertNotIn('firewall.', changes)
+
     def parse(self, raw):
         start = SOURCE.index('CFUN="" CPIN=')
         end = SOURCE.index('\nreg_stat()', start)
@@ -61,7 +95,7 @@ OK''')
             # Substitute only the hardware discovery, leaving the AT decision intact.
             prefix = prefix.replace('\nfind_modem_usb\n', '\nfind_modem_usb() { :; }\n')
             stubs = '''
-uci() { echo /dev/null; }
+uci() { case "$*" in *mt5700.modem.transport*) echo usb ;; *) echo /dev/null ;; esac; }
 lock() { return 0; }
 ubus() { echo '{"pending": false}'; }
 gcom() { echo called >> "$TEST_MARKER"; printf 'OK\\n'; }

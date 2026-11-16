@@ -22,7 +22,10 @@
 [ "$(board_name)" = "nradio,nbcpe" ] || exit 0
 
 LOCKFILE="/var/lock/mt5700.lock"
+TRANSPORT=$(uci -q get mt5700.modem.transport)
+[ "$TRANSPORT" = "usb" ] || TRANSPORT=ethernet
 RAW_STAMP="/tmp/mt5700.status.raw"
+[ "$TRANSPORT" = "ethernet" ] && RAW_STAMP="/tmp/mt5700.ethernet.raw"
 SLOT_STAMP="/tmp/mt5700.active_slot"
 TEMP_STAMP="/tmp/mt5700.chip_temp"
 
@@ -62,9 +65,15 @@ SOURCE="none"
 BUSY=0
 AGE=999999
 
+if [ "$TRANSPORT" = "usb" ]; then
 find_modem_usb
 MODEM_AT=$(uci -q get network.wwan.device)
 [ -c "$MODEM_AT" ] || MODEM_AT=""
+else
+	MODEM_NET=wan
+	MODEM_AT=192.168.8.1:20249
+	[ "${1:-}" = "--refresh" ] && /usr/sbin/mt5700-ethernet --once >/dev/null 2>&1
+fi
 
 RAW=$(cat "$RAW_STAMP" 2>/dev/null)
 AGE=$(stamp_age)
@@ -73,7 +82,7 @@ wwan_is_pending() {
 	ubus call network.interface.wwan status 2>/dev/null | grep -q '"pending":[[:space:]]*true'
 }
 
-if [ "${1:-}" = "--refresh" ] && [ -n "$MODEM_AT" ]; then
+if [ "$TRANSPORT" = "usb" ] && [ "${1:-}" = "--refresh" ] && [ -n "$MODEM_AT" ]; then
 	# Never sweep while netifd's ncm.sh owns the AT port: it does not take
 	# our private lock, and interleaving a 40s sweep with a dial attempt
 	# can break registration (same guard as refresh_status_raw).
@@ -101,6 +110,7 @@ if [ "${1:-}" = "--refresh" ] && [ -n "$MODEM_AT" ]; then
 fi
 
 [ -n "$RAW" ] && [ "$SOURCE" != "direct" ] && SOURCE="daemon"
+[ -n "$RAW" ] && [ "$TRANSPORT" = "ethernet" ] && SOURCE="ethernet"
 
 # ---- parse raw AT burst (last matching line wins; URC noise tolerated) ----
 # Note: TD Tech "^" responses carry a literal caret prefix ('\^HCSQ: ...').
@@ -256,6 +266,21 @@ if [ -n "$HCSQV" ] && [ -n "$HCSQ" ]; then
 	esac
 fi
 
+if [ "$TRANSPORT" = "ethernet" ]; then
+	case "$MONSC_RAT" in
+	NR)
+		H_RSRP=$(printf '%s' "$MONSC_FIELDS" | awk -F, 'NF >= 10 { print $8 }')
+		H_RSRQ_DC=$(printf '%s' "$MONSC_FIELDS" | awk -F, 'NF >= 10 { print int($9 * 10) }')
+		H_SINR_DC=$(printf '%s' "$MONSC_FIELDS" | awk -F, 'NF >= 10 { print int($10 * 10) }')
+		;;
+	LTE)
+		H_RSRP=$(printf '%s' "$MONSC_FIELDS" | awk -F, 'NF >= 9 { print $7 }')
+		H_RSRQ_DC=$(printf '%s' "$MONSC_FIELDS" | awk -F, 'NF >= 9 { print int($8 * 10) }')
+		H_RSSI=$(printf '%s' "$MONSC_FIELDS" | awk -F, 'NF >= 9 { print $9 }')
+		;;
+	esac
+fi
+
 # CEREG / C5GREG: <n>,<stat>[,<tac>,<ci>,<AcT>]
 CEREG_STAT=$(echo "$CEREG" | cut -d, -f2)
 CEREG_ACT=$(echo "$CEREG" | cut -d, -f5)
@@ -283,6 +308,10 @@ if [ -n "$CHIPTEMP" ]; then
 		END { if (n) print int(m) }')
 fi
 [ -n "$TEMP_DC" ] || TEMP_DC=$(cat "$TEMP_STAMP" 2>/dev/null | tr -cd '0-9-')
+# Factory huawei.sh uses sensor 8 for MT5700 ODU chip temperature.
+if [ "$TRANSPORT" = "ethernet" ]; then
+	TEMP_DC=$(printf '%s\n' "$CHIPTEMP" | awk -F, 'NF >= 8 && $8 >= -400 && $8 <= 1250 { print int($8) }')
+fi
 
 # ---- always-fresh runtime facts ----
 ACTIVE_SLOT=$(cat "$SLOT_STAMP" 2>/dev/null | tr -d ' \r\n')
@@ -331,15 +360,27 @@ case "$CPIN" in
 	;;
 esac
 
+if [ "$TRANSPORT" = "ethernet" ]; then
+	# SCICHG reports the modem's current slot; do not consult USB GPIO/stamps.
+	case "${SCICHG%%,*}" in 0) ACTIVE_SLOT=external ;; 1) ACTIVE_SLOT=internal ;; *) ACTIVE_SLOT="" ;; esac
+	SIM_TRANSITION=0
+	[ -n "$CPIN" ] || { SIM_PHASE=unknown; SIM_STATE_CN='尚未取得 SIM 状态'; }
+fi
 SEL_GPIO=$(cat /sys/class/gpio/cpe-sel0/value 2>/dev/null | tr -d ' \r\n')
 CARRIER_LINK=""
 [ -n "$MODEM_NET" ] && CARRIER_LINK=$(cat "/sys/class/net/$MODEM_NET/carrier" 2>/dev/null | tr -d ' \r\n')
 
 # jsonfilter renders JSON booleans as true/false
+if [ "$TRANSPORT" = "ethernet" ]; then
+	WWAN_STATUS=$(ubus call network.interface.wan status 2>/dev/null)
+	WWAN4_IP=$(jsonfilter -s "$WWAN_STATUS" -e "@['ipv4-address'][0].address" 2>/dev/null)
+	WWAN6_IP=$(ubus call network.interface.wan6 status 2>/dev/null | jsonfilter -e "@['ipv6-address'][0].address" 2>/dev/null)
+else
 WWAN_STATUS=$(ubus call network.interface.wwan status 2>/dev/null)
 # jsonfilter needs quoted keys for hyphenated JSON members
 WWAN4_IP=$(ubus call network.interface.wwan_4 status 2>/dev/null | jsonfilter -e "@['ipv4-address'][0].address" 2>/dev/null)
 WWAN6_IP=$(ubus call network.interface.wwan_6 status 2>/dev/null | jsonfilter -e "@['ipv6-address'][0].address" 2>/dev/null)
+fi
 [ "$(jsonfilter -s "$WWAN_STATUS" -e '@.up' 2>/dev/null)" = "true" ] && WWAN_UP=1 || WWAN_UP=0
 [ "$(jsonfilter -s "$WWAN_STATUS" -e '@.pending' 2>/dev/null)" = "true" ] && WWAN_PENDING=1 || WWAN_PENDING=0
 
@@ -354,8 +395,24 @@ CFG_INTERVAL=$(uci -q get mt5700.modem.check_interval)
 [ -n "$CFG_INTERVAL" ] || CFG_INTERVAL=30
 
 # ---- emit JSON ----
+PRESENT=0
+SAMPLE_ERROR=""
+LINK_SPEED=""
+if [ "$TRANSPORT" = "ethernet" ]; then
+	[ -n "$RAW" ] && [ "$CARRIER_LINK" = 1 ] && [ "$AGE" -le 90 ] && PRESENT=1
+	SAMPLE_ERROR=$(cat /tmp/mt5700.ethernet.error 2>/dev/null)
+	LINK_SPEED=$(cat /sys/class/net/wan/speed 2>/dev/null)
+	CFG_SLOT=""
+	CFG_APN="$DSAMBR_APN"
+	SEL_GPIO=""
+else
+	[ -n "$MODEM_SPEED" ] && PRESENT=1
+fi
 json_init
-json_add_boolean "present" $([ -n "$MODEM_SPEED" ] && echo 1 || echo 0)
+json_add_string "transport" "$TRANSPORT"
+json_add_string "link_speed" "$LINK_SPEED"
+json_add_string "sample_error" "$SAMPLE_ERROR"
+json_add_boolean "present" "$PRESENT"
 json_add_string "usb_speed" "$MODEM_SPEED"
 json_add_string "at_port" "$MODEM_AT"
 json_add_string "netdev" "$MODEM_NET"
@@ -365,7 +422,17 @@ json_add_string "source" "$SOURCE"
 json_add_int "stamp_age" "$AGE"
 json_add_string "cfun" "$CFUN"
 
+SWITCH_STATE=$(jsonfilter -i /tmp/mt5700.sim.json -e '@.state' 2>/dev/null)
+SWITCH_TARGET=$(jsonfilter -i /tmp/mt5700.sim.json -e '@.target' 2>/dev/null)
+SWITCH_ERROR=$(jsonfilter -i /tmp/mt5700.sim.json -e '@.error' 2>/dev/null)
+if [ "$TRANSPORT" = "ethernet" ] && [ "$SWITCH_STATE" = switching ]; then
+	SIM_PHASE=switching
+	SIM_TRANSITION=1
+fi
 json_add_object "sim"
+json_add_string "switch_state" "${SWITCH_STATE:-idle}"
+json_add_string "switch_target" "$SWITCH_TARGET"
+json_add_string "switch_error" "$SWITCH_ERROR"
 json_add_string "state" "$CPIN"
 json_add_string "state_cn" "$SIM_STATE_CN"
 json_add_string "phase" "$SIM_PHASE"
@@ -441,7 +508,13 @@ T_LIVE_RX=""; T_LIVE_TX=""; T_UPTIME=""
 	T_LIVE_RX=$(cat "/sys/class/net/$MODEM_NET/statistics/rx_bytes" 2>/dev/null | tr -cd '0-9')
 	T_LIVE_TX=$(cat "/sys/class/net/$MODEM_NET/statistics/tx_bytes" 2>/dev/null | tr -cd '0-9')
 }
-T_UPTIME=$(ubus call network.interface.wwan_4 status 2>/dev/null | jsonfilter -e '@.uptime' 2>/dev/null)
+if [ "$TRANSPORT" = "ethernet" ]; then
+	T_UPTIME=$(jsonfilter -s "$WWAN_STATUS" -e '@.uptime' 2>/dev/null)
+	# USB accounting/quota files have no meaning for the independent WAN link.
+	TRAFFIC_DB=/dev/null
+else
+	T_UPTIME=$(ubus call network.interface.wwan_4 status 2>/dev/null | jsonfilter -e '@.uptime' 2>/dev/null)
+fi
 [ -f "$TRAFFIC_DB" ] && eval "$(sed -n 's/^\([a-z_]*\)=\([^ ]*\)$/\1="\2"/p' "$TRAFFIC_DB")"
 T_BASE_RX=$(sed -n 's/^base_rx=//p' /tmp/mt5700.session 2>/dev/null | tr -cd '0-9')
 T_BASE_TX=$(sed -n 's/^base_tx=//p' /tmp/mt5700.session 2>/dev/null | tr -cd '0-9')
@@ -452,6 +525,10 @@ T_SESS_TX=$(( ${T_LIVE_TX:-0} - T_BASE_TX ))
 [ "$T_SESS_TX" -ge 0 ] 2>/dev/null || T_SESS_TX=0
 [ "$T_SESS_RX" -ge 0 ] 2>/dev/null || T_SESS_RX=0
 [ "$T_SESS_TX" -ge 0 ] 2>/dev/null || T_SESS_TX=0
+if [ "$TRANSPORT" = "ethernet" ]; then
+	T_SESS_RX=${T_LIVE_RX:-0}
+	T_SESS_TX=${T_LIVE_TX:-0}
+fi
 json_add_object "traffic"
 json_add_string "live_rx" "${T_LIVE_RX:-0}"
 json_add_string "live_tx" "${T_LIVE_TX:-0}"
@@ -471,6 +548,7 @@ T_ACTION=$(uci -q get mt5700.modem.traffic_action)
 [ -n "$T_LIMIT_MB" ] || T_LIMIT_MB=""
 [ -n "$T_RESET_DAY" ] || T_RESET_DAY=1
 [ -n "$T_ACTION" ] || T_ACTION=notify
+[ "$TRANSPORT" != "ethernet" ] || { T_LIMIT_MB=""; T_ACTION=notify; }
 json_add_string "limit_mb" "$T_LIMIT_MB"
 json_add_int "reset_day" "$T_RESET_DAY"
 json_add_string "action" "$T_ACTION"

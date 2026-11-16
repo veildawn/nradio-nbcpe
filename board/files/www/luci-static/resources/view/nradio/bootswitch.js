@@ -138,8 +138,8 @@ return view.extend({
 					]),
 					E('ul', { 'class': 'nr-bs-list' }, [
 						E('li', {}, [ '启动标记：', E('code', {}, 'boot_system=0') ]),
-						E('li', {}, [ '切回方式：原厂系统 Web 的 Switch system 或 SSH 执行 ', E('code', {}, 'nbcpe-bootswitch to-openwrt') ]),
-						E('li', {}, '适用场景：跨内核版本完整包升级或使用原厂管理功能')
+						E('li', {}, '切回方式：进入原厂系统 Web 管理页面，使用 Switch system 切回第二系统'),
+						E('li', {}, '适用场景：使用原厂管理功能或维护第二系统固件')
 					])
 			])
 		]));
@@ -171,7 +171,7 @@ return view.extend({
 				E('ul', {}, [
 					E('li', {}, '写入 boot_system=0（通过原厂 ubenv 工具，写入前校验环境变量完整性）；'),
 					E('li', {}, '第二系统中的 OpenWrt 系统与全部配置完全保留；'),
-					E('li', {}, '重启后进入原厂固件，之后可在原厂 Web 界面 Switch system 或 SSH（nbcpe-bootswitch to-openwrt）再切回。')
+						E('li', {}, '重启后进入原厂固件，之后可在原厂 Web 管理页面使用 Switch system 再切回第二系统。')
 				]),
 			E('div', { 'class': 'right' }, [
 				E('button', {

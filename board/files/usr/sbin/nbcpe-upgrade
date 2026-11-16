@@ -9,7 +9,7 @@
 #   info            identify the running firmware without network access
 #   download URL SHA256 [MIRROR] [TAG]   start background download+verify
 #   status          emit download progress/state as JSON
-#   preflight       verify downloaded image is ready to flash
+#   preflight SHA256 [keep|reset]   verify image, config mode and boot target
 
 . /lib/functions.sh
 . /usr/share/libubox/jshn.sh
@@ -188,9 +188,8 @@ do_check() {
 		return 1
 	}
 
-	# Kernel match: this upgrade path writes the rootfs only, so a release
-	# built on a different kernel must not be flashed online (old kernel +
-	# new modules = broken USB/Wi-Fi). Release names carry "Linux <ver>".
+	# Kernel comparison is informational: this device updates the second-system
+	# kernel and rootfs together. Release names carry "Linux <ver>".
 	rel_kver=$(printf '%s' "$rel_name" | sed -n 's/.*Linux \([0-9][0-9.]*\).*/\1/p')
 	cur_info
 	cur_kver="$CUR_KERNEL"
@@ -337,8 +336,27 @@ do_status() {
 	json_dump
 }
 
+openwrt_target_ready() {
+	local target
+	BOOT_ERROR=""
+	target=$(/usr/sbin/nbcpe-bootswitch status 2>/dev/null) || {
+		BOOT_ERROR="无法确认下次启动目标，已停止升级；请先检查双系统切换状态"
+		return 1
+	}
+	case "$target" in
+	'boot_system=1 (openwrt-second-system)') return 0 ;;
+	'boot_system=0 (factory-system)')
+		BOOT_ERROR="下次启动目标已设为原厂系统，请先在双系统切换页面取消切换、保持 OpenWrt，再升级"
+		;;
+	*) BOOT_ERROR="启动目标状态异常，已停止升级；请先检查双系统切换状态" ;;
+	esac
+	return 1
+}
+
 verify_image() {
-	local st expected sha tag msg total kernel got
+	local st expected sha tag msg total kernel got mode="${2:-keep}"
+	case "$mode" in keep|reset) ;; *) error "升级方式无效"; return 1 ;; esac
+	openwrt_target_ready || { error "$BOOT_ERROR"; return 1; }
 	read_state
 	[ "$st" = done ] && [ -s "$BIN" ] || { error "固件尚未就绪，请重新下载"; return 1; }
 	[ -z "${1:-}" ] || [ "$1" = "$expected" ] || {
@@ -348,7 +366,14 @@ verify_image() {
 	[ -n "$expected" ] && [ "$got" = "$expected" ] || {
 		error "SHA-256 校验失败，请重新下载"; return 1
 	}
-	/sbin/sysupgrade -T "$BIN" >/dev/null 2>&1 || {
+	# Validation must use the selected config mode: a minor compat_version
+	# change can be valid with -n while rightly rejecting preserved settings.
+	if [ "$mode" = reset ]; then
+		/sbin/sysupgrade -n -T "$BIN" >/dev/null 2>&1
+	else
+		/sbin/sysupgrade -T "$BIN" >/dev/null 2>&1
+	fi
+	[ "$?" -eq 0 ] || {
 		error "固件未通过设备兼容性检查，请重新下载适用的固件"; return 1
 	}
 }
@@ -356,7 +381,7 @@ verify_image() {
 do_preflight() {
 	acquire_lock || { error "已有下载或升级正在进行中"; return 1; }
 	trap release_lock EXIT
-	verify_image "$1" || return 1
+	verify_image "$1" "${2:-keep}" || return 1
 	json_init
 	json_add_int ready 1
 	json_dump
@@ -367,7 +392,7 @@ do_flash() {
 	case "$mode" in keep|reset) ;; *) error "升级方式无效"; return 1 ;; esac
 	[ -n "$digest" ] || { error "缺少固件摘要，请刷新页面"; return 1; }
 	acquire_lock || { error "已有下载或升级正在进行中"; return 1; }
-	if ! verify_image "$digest"; then release_lock; return 1; fi
+	if ! verify_image "$digest" "$mode"; then release_lock; return 1; fi
 	state_set state flashing || { release_lock; error "无法保存升级状态"; return 1; }
 	setsid /bin/sh "$0" _flash "$mode" </dev/null >/dev/null 2>&1 &
 	json_init
@@ -381,6 +406,11 @@ flash_worker() {
 	trap 'exit 1' INT TERM
 	# Give rpcd time to deliver the acknowledgement before networking stops.
 	sleep 2
+	# The target may have changed after the confirmation dialog or handoff.
+	openwrt_target_ready || {
+		state_set state error msg "$BOOT_ERROR"
+		return 1
+	}
 	if [ "$1" = reset ]; then /sbin/sysupgrade -n "$BIN"; else /sbin/sysupgrade "$BIN"; fi
 	if [ "$?" -ne 0 ]; then
 		state_set state error msg "升级程序执行失败，请查看系统日志后重试"
@@ -397,9 +427,9 @@ check) do_check "${2:-}" ;;
 download) do_download "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
 status) do_status ;;
 info) do_info ;;
-preflight) do_preflight "${2:-}" ;;
+preflight) do_preflight "${2:-}" "${3:-keep}" ;;
 flash) do_flash "${2:-}" "${3:-}" ;;
 _download) download_worker "$2" "$3" "$4" "$5" "$6" ;;
 _flash) flash_worker "$2" ;;
-*) echo "Usage: $0 {check [force]|download <url> <sha256> [mirror-prefix] [tag]|status|preflight [sha256]|flash <keep|reset> <sha256>}" >&2; exit 1 ;;
+*) echo "Usage: $0 {check [force]|download <url> <sha256> [mirror-prefix] [tag]|status|preflight [sha256] [keep|reset]|flash <keep|reset> <sha256>}" >&2; exit 1 ;;
 esac

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: (GPL-2.0 OR MIT)
 /*
- * NRadio NBCPE (WT9111) — MT7981A + MT7531 + MaxLinear GPY115 (2.5G WAN) + 8 GB eMMC
- * + on-board TD Tech MT5700M-CN 5G modem (USB NCM).
+ * NRadio NBCPE (WT9111) — MT7981B + MT7531 + MaxLinear GPY211B (2.5G WAN) + 8 GB eMMC
+ * + TD Tech MT5700M-CN 5G modem connected over the PoE Ethernet uplink.
  *
  * The stock bootloader boots the second system from PARTLABEL=kernel_2nd with
  * this DTB and root=PARTLABEL=rootfs_2nd (squashfs + f2fs rootdisk overlay).
@@ -75,7 +75,8 @@
 		led-wifi {
 			label = "blue:wifi";
 			gpios = <&pio 13 GPIO_ACTIVE_LOW>;
-			linux,default-trigger = "phy0assoc";
+			/* nbcpe-leds combines the enabled state of both AP radios. */
+			linux,default-trigger = "phy0radio";
 		};
 	};
 

@@ -1,0 +1,46 @@
+#!/bin/sh
+# Read-only ODU monitor. This process never controls power, SIM, APN or dialing.
+. /lib/functions.sh
+[ "$(board_name)" = "nradio,nbcpe" ] || exit 0
+umask 077
+RAW=/tmp/mt5700.ethernet.raw
+ERROR=/tmp/mt5700.ethernet.error
+LOCK=/var/lock/mt5700.ethernet.lock
+
+sample_once() {
+	[ "$(uci -q get mt5700.modem.transport)" != "usb" ] || return 0
+	[ "$(uci -q get mt5700.modem.enabled)" != "0" ] || return 0
+	[ "$(cat /sys/class/net/wan/carrier 2>/dev/null)" = "1" ] || {
+		printf '%s\n' '网口未连接' > "$ERROR"
+		return 1
+	}
+	lock -n "$LOCK" || return 0
+	trap 'rm -f "$RAW.$$"; lock -u "$LOCK"' EXIT
+	trap 'exit 0' INT TERM
+	if timeout 45 ucode /usr/share/nradio-nbcpe/mt5700-ethernet.uc > "$RAW.$$" 2>/dev/null &&
+		[ -s "$RAW.$$" ]; then
+		mv -f "$RAW.$$" "$RAW"
+		rm -f "$ERROR"
+	else
+		printf '%s\n' '模组 AT 状态读取失败，将自动重试' > "$ERROR"
+		rm -f "$RAW.$$"
+	fi
+	lock -u "$LOCK"
+	trap - EXIT INT TERM
+}
+
+case "${1:---once}" in
+--daemon)
+	while true; do
+		sample_once
+		/usr/sbin/nbcpe-leds >/dev/null 2>&1
+		interval=$(uci -q get mt5700.modem.check_interval)
+		case "$interval" in ''|*[!0-9]*) interval=30 ;; esac
+		[ "$interval" -ge 10 ] && [ "$interval" -le 600 ] || interval=30
+		sleep "$interval" &
+		wait $!
+	done
+	;;
+--once) sample_once; /usr/sbin/nbcpe-leds >/dev/null 2>&1 ;;
+*) echo "Usage: $0 [--once|--daemon]" >&2; exit 1 ;;
+esac

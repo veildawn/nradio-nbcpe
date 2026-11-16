@@ -66,8 +66,15 @@ class UpgradeTests(unittest.TestCase):
         self.state = self.root / 'nbcpe-upgrade.state'
         self.bin = self.root / 'nbcpe-upgrade-sysupgrade.bin'
         self.lock = self.root / 'nbcpe-upgrade.lock'
+        self.boot_target = self.root / 'boot-target'
+        self.boot_target.write_text('boot_system=1 (openwrt-second-system)\n')
         self.stub('uname', 'echo 6.18.60')
         self.stub('setsid', 'exec "$@"')
+        self.stub('nbcpe-bootswitch', '''
+[ "$1" = status ] || exit 1
+[ ! -e "$TEST_ROOT/fail-boot-read" ] || exit 1
+cat "$TEST_ROOT/boot-target"
+''')
         self.stub('wget', '''
 while [ "$1" != -O ]; do shift; done
 shift
@@ -80,12 +87,22 @@ cp "$TEST_ROOT/fixture.bin" "$1"
         self.stub('sysupgrade', '''
 printf '%s\\n' "$*" >> "$TEST_ROOT/flash-calls"
 [ ! -e "$TEST_ROOT/reject-image" ] || exit 1
-[ "$1" = -T ] || [ ! -e "$TEST_ROOT/fail-flash" ]
+testing=0 reset=0
+for arg in "$@"; do
+    [ "$arg" != -T ] || testing=1
+    [ "$arg" != -n ] || reset=1
+done
+if [ "$testing" = 1 ]; then
+    [ ! -e "$TEST_ROOT/require-reset" ] || [ "$reset" = 1 ]
+else
+    [ ! -e "$TEST_ROOT/fail-flash" ]
+fi
 ''')
         src = (ROOT / 'board/files/usr/sbin/nbcpe-upgrade').read_text()
         src = src.replace('. /lib/functions.sh', '').replace('. /usr/share/libubox/jshn.sh', f'. "{self.root}/json.sh"')
         src = src.replace('/tmp/nbcpe-upgrade', str(self.root / 'nbcpe-upgrade'))
         src = src.replace('/sbin/sysupgrade', str(self.root / 'commands/sysupgrade'))
+        src = src.replace('/usr/sbin/nbcpe-bootswitch', str(self.root / 'commands/nbcpe-bootswitch'))
         # workers are exec'd through /bin/sh; use the same modern shell on macOS
         src = src.replace('setsid /bin/sh "$0"', 'setsid ' + self.sh_path() + ' "$0"')
         self.installed_release = self.root / 'installed-release'
@@ -205,8 +222,83 @@ printf '%s\\n' "$*" >> "$TEST_ROOT/flash-calls"
         self.assertTrue(self.call('flash', 'reset', self.digest)['started'])
         self.settle('error')
         calls = (self.root / 'flash-calls').read_text().splitlines()
-        self.assertTrue(calls[0].startswith('-T '))
+        self.assertTrue(calls[0].startswith('-n -T '))
         self.assertTrue(calls[1].startswith('-n '))
+
+    def test_pending_factory_target_rejects_preflight_and_flash(self):
+        self.staged()
+        self.boot_target.write_text('boot_system=0 (factory-system)\n')
+        for args in (('preflight', self.digest, 'keep'),
+                     ('preflight', self.digest, 'reset'),
+                     ('flash', 'keep', self.digest),
+                     ('flash', 'reset', self.digest)):
+            with self.subTest(args=args):
+                result = self.call(*args, ok=False)
+                self.assertIn('取消切换', result['error'])
+                self.assertFalse(self.lock.exists())
+                self.assertTrue(self.state.read_text().startswith('state=done\n'))
+        self.assertFalse((self.root / 'flash-calls').exists())
+
+    def test_unknown_or_unreadable_boot_target_fails_closed(self):
+        self.staged()
+        self.boot_target.write_text('boot_system=unexpected\n')
+        self.assertIn('启动目标', self.call('preflight', self.digest, ok=False)['error'])
+        (self.root / 'fail-boot-read').touch()
+        self.assertIn('启动目标', self.call('flash', 'keep', self.digest, ok=False)['error'])
+        self.assertFalse((self.root / 'flash-calls').exists())
+        self.assertFalse(self.lock.exists())
+
+    def test_boot_target_is_rechecked_after_confirmation(self):
+        self.staged()
+        self.assertEqual(self.call('preflight', self.digest, 'keep')['ready'], 1)
+        self.boot_target.write_text('boot_system=0 (factory-system)\n')
+        self.assertIn('取消切换', self.call('flash', 'keep', self.digest, ok=False)['error'])
+        self.assertEqual(len((self.root / 'flash-calls').read_text().splitlines()), 1)
+
+    def test_worker_rechecks_boot_target_before_sysupgrade(self):
+        self.staged()
+        hold = self.root / 'hold-handoff'
+        hold.touch()
+        self.stub('sleep', '''
+if [ "$1" = 2 ]; then
+    touch "$TEST_ROOT/awaiting-handoff"
+    while [ -e "$TEST_ROOT/hold-handoff" ]; do /bin/sleep 0.05; done
+fi
+''')
+        self.assertTrue(self.call('flash', 'keep', self.digest)['started'])
+        try:
+            deadline = time.monotonic() + 5
+            while not (self.root / 'awaiting-handoff').exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue((self.root / 'awaiting-handoff').exists())
+            self.boot_target.write_text('boot_system=0 (factory-system)\n')
+        finally:
+            hold.unlink()
+        self.settle('error')
+        self.assertIn('取消切换', self.call('status')['msg'])
+        calls = (self.root / 'flash-calls').read_text().splitlines()
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0].startswith('-T '))
+
+    def test_reset_validation_allows_a_config_incompatible_image(self):
+        self.staged()
+        (self.root / 'require-reset').touch()
+        self.assertIn('兼容性', self.call('preflight', self.digest, 'keep', ok=False)['error'])
+        self.assertEqual(self.call('preflight', self.digest, 'reset')['ready'], 1)
+        self.assertIn('兼容性', self.call('flash', 'keep', self.digest, ok=False)['error'])
+        # Stop the mocked flash after handoff rather than entering the reboot wait.
+        (self.root / 'fail-flash').touch()
+        self.assertTrue(self.call('flash', 'reset', self.digest)['started'])
+        self.settle('error')
+        calls = (self.root / 'flash-calls').read_text().splitlines()
+        self.assertTrue(calls[-2].startswith('-n -T '))
+        self.assertTrue(calls[-1].startswith('-n '))
+
+    def test_preflight_rejects_invalid_mode(self):
+        self.staged()
+        self.assertIn('升级方式', self.call('preflight', self.digest, 'unknown', ok=False)['error'])
+        self.assertFalse((self.root / 'flash-calls').exists())
+        self.assertFalse(self.lock.exists())
 
     def test_successful_flash_handoff_is_not_reported_as_immediate_failure(self):
         self.staged()

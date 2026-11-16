@@ -158,6 +158,7 @@ jobs:
               # The first whitespace token is the package name in both formats.
               pkgs = {line.split()[0] for line in mf if line.strip()}
           assert "kmod-tun" in pkgs, "Firmware is missing kmod-tun"
+          assert "ucode-mod-socket" in pkgs, "Firmware is missing the Ethernet AT socket module"
           assert "blkid" in pkgs, "Firmware is missing blkid (preinit and factory ubenv require it)"
           assert "kmod-mt7915e" in pkgs and "kmod-mt7981-firmware" in pkgs, "Firmware is missing MT7981 Wi-Fi drivers"
           if "luci-i18n-base-zh-cn" in pkgs:
@@ -199,13 +200,15 @@ jobs:
           blkid = root / 'usr/sbin/blkid'
           assert blkid.is_file() and blkid.stat().st_mode & 0o111, 'blkid executable missing'
           assert blkid.read_bytes()[:4] == b'\x7fELF', 'Expected the full util-linux blkid'
-          for name in ('lib/preinit/35_nradio_emmc_overlay', 'usr/sbin/nbcpe-bootswitch', 'usr/bin/ubenv'):
+          for name in ('lib/preinit/35_nradio_emmc_overlay', 'usr/sbin/nbcpe-bootswitch', 'usr/bin/ubenv', 'usr/sbin/mt5700-ethernet', 'usr/sbin/mt5700-status', 'usr/sbin/mt5700-sim', 'usr/sbin/nbcpe-leds', 'usr/share/nradio-nbcpe/mt5700-ethernet.uc'):
               assert (root / name).read_bytes() == (Path('board/files') / name).read_bytes(), name
           assert (root / 'usr/bin/ubenv').stat().st_mode & 0o111
           assert (root / 'usr/sbin/nbcpe-bootswitch').stat().st_mode & 0o111
           PY
           sudo install -m 755 /usr/bin/qemu-aarch64-static /tmp/ib/rootfs-check/tmp/qemu-aarch64-static
           sudo chroot /tmp/ib/rootfs-check /tmp/qemu-aarch64-static /usr/sbin/blkid --version
+          sudo chroot /tmp/ib/rootfs-check /tmp/qemu-aarch64-static /usr/bin/ucode -e 'import * as s from "socket"; if (type(s.create) != "function") exit(1); print("Ethernet AT socket module ready\n");'
+          sudo chroot /tmp/ib/rootfs-check /tmp/qemu-aarch64-static /usr/bin/ucode -c -o /tmp/ethernet-test.uc /usr/share/nradio-nbcpe/mt5700-ethernet.uc
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
@@ -230,9 +233,9 @@ jobs:
           - **内核与在线软件源**：Linux \`${KVER}\`，内核 \`vermagic\` 与 \`downloads.openwrt.org\` 官方 \`mediatek/filogic\` Snapshot 完全一致，刷入后可直接执行 \`apk update && apk add <pkg>\` 在线安装官方全部 \`kmod-*\` 与软件包。
           - **Wi-Fi 6 (\`MT7981\` 双频 DBDC)**：主线开源 \`mt76\`（\`kmod-mt7915e\` + \`kmod-mt7981-firmware\`），EEPROM 校准数据只读挂载自 eMMC \`factory\` 分区，默认 \`country=CN\`。
           - **默认无线**：新安装启用 \`NRadio-NBCPE-2G\` 和 \`NRadio-NBCPE-5G\`，使用 WPA2/WPA3 混合加密，初始密码为 \`12345678\`。
-          - **5G 蜂窝 (\`MT5700M-CN\` \`3466:3301\`)**：内置 \`mt5700\` 守护服务（\`comgt-ncm\` + \`luci-proto-ncm\`），支持 USB 自动挂起抑制、\`cpe-pwr\` 冷断电自愈、热重启 USB 2.0 → USB 3.0 (\`5000M\`) 自动重训练、模组 NVRAM 异常自愈（自动恢复 \`TDCFG\` 网卡模式与 \`C5GOPTION\` 5G SA）、双 SIM 卡自动切换、四大运营商 APN 自动配置、\`fw4\` 防火墙域与单 \`/64\` IPv6 \`odhcpd\` \`ndp=relay\` 下发及状态灯同步。
-          - **内置 \`luci-app-nradio-nbcpe\` 中文管理页（本仓库自带，随固件预装）**：**网络 → 5G 蜂窝**——模组/SIM（卡槽切换、IMSI/ICCID、运营商与注册状态）、\`AT^HCSQ\` 信号质量（RSRP/SINR/RSRQ 分制式解码 + 信号条）、蜂窝连接 IPv4/IPv6、模组温度实时状态，并可在页面直接配置 SIM 卡槽/APN/USB3 重训练/NVRAM 自愈/巡检间隔；**系统 → 双系统切换**——Web 一键切换回原厂固件（\`boot_system\` 通过原厂 \`ubenv\` 工具写入 eMMC \`u-boot-env\`，写入前校验环境完整性，含确认弹窗、待重启警告与一键取消切回）；**系统 → 在线固件更新**——直连本仓库 GitHub Release 检查新版本（SHA-256 摘要来自 api.github.com）、下载校验后可选「保留配置 / 不保留配置」一键 sysupgrade，同时刷新 \`kernel_2nd\` 与 \`rootfs_2nd\`（支持跨内核版本在线升级，支持自定义下载加速前缀）。
-          - **有线与系统**：\`LAN ×3 = lan1-3\`（MT7531 交换机）、\`WAN = wan\`（MaxLinear GPY115 2.5G PHY）、\`zram-swap\`（1 GB DDR3 下 50% 自适应压缩交换）、eMMC 第二系统启动保护（GPT 布局与 squashfs 根校验不符即进 failsafe，绝不写入原厂分区）。
+          - **5G 蜂窝（MT5700M-CN 网口桥接）**：通过 TCP AT 接口采集注册、信号、小区、SIM 和温度，手动切换内置/外置 SIM；默认不进行 USB 重训练、冷断电恢复或 NVRAM 自动改写。
+          - **中文管理页**：5G 蜂窝页区分网口连接、AT 采样与注册状态；双系统切换页提供启动目标校验；在线升级校验摘要和机型，并支持保留配置或清除第二系统配置。
+          - **有线与系统**：3 个 LAN、1 个 PoE/5G 桥接上行口（GPY211B 2.5G PHY）；IPv4/IPv6 共用同一上行。原厂配置与第二系统配置分别保存在 p7 / p9，互不导入。4G/5G 灯按实际注册状态更新，Wi-Fi 灯按双频启用状态更新。
 
           ### 刷入、SSH 登录与双系统切换说明
           - **首次安装**：在原厂 Web（\`192.168.10.1\`）「Backup / Flash Firmware → Flash second system」上传本 \`sysupgrade.bin\`（未签名 \`ustar\` \`compat_version 1.0\`，写入 eMMC \`kernel_2nd\` + \`rootfs_2nd\`，原厂系统分区不受影响），烧录完成后点击 **Switch system** 切换到第二系统启动。

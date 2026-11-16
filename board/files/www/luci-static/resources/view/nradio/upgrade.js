@@ -701,14 +701,14 @@ return view.extend({
 		this.busy = true;
 		this.updateActions();
 		this.setNotice('正在执行刷写前兼容性与摘要复核（sysupgrade -T）…', false);
-		return exec([ 'preflight', digest ]).then(L.bind(function() {
+		return exec([ 'preflight', digest, reset ? 'reset' : 'keep' ]).then(L.bind(function() {
 			this.setNotice('', false);
 			ui.showModal(reset ? '清除配置并升级' : '保留配置升级', [
 				E('p', {}, '即将刷入固件版本：' + (this.download.tag || '未知版本')),
 				E('p', {}, reset
-					? 'Wi-Fi、SIM、APN、防火墙和管理密码等设置将恢复默认。重启后请用网线连接 LAN 口，访问 192.168.1.1 重新设置。'
+					? '第二系统的 Wi-Fi、防火墙和管理密码等设置将恢复默认，原厂系统配置保持不变。重启后请用网线连接 LAN 口，访问 192.168.1.1 重新设置。'
 					: '保留现有系统配置，后期自行安装的附加软件包需重新安装。升级后管理地址保持不变。'),
-				E('p', {}, '写入与重启约需 2–3 分钟，期间请勿断电或拔出 TF 卡。'),
+				E('p', {}, '写入 eMMC 与重启约需 2–3 分钟，期间请勿断电。'),
 				E('div', { 'class': 'right' }, [
 					E('button', { 'class': 'btn', 'click': ui.hideModal }, '取消'), ' ',
 					E('button', { 'class': 'btn cbi-button-negative', 'click': L.bind(this.doFlash, this, reset, digest) }, '确认升级')

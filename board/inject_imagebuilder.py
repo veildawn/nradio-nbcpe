@@ -15,6 +15,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from arm64_image import KERNEL_LOAD_ADDRESS, validate_load_address
+from network import patch_board_network
 from platform_upgrade import patch_platform_upgrade
 
 
@@ -31,6 +33,7 @@ DEVICE_PACKAGES = [
     "kmod-mt7915e",
     "kmod-mt7981-firmware",
     "blkid",
+    "ucode-mod-socket",
     "e2fsprogs",
     "f2fsck",
     "mkf2fs",
@@ -140,7 +143,7 @@ def main() -> None:
         )
         pre_tmp.unlink(missing_ok=True)
 
-    # 1b. Assemble FIT kernel image (nradio_nbcpe-kernel.bin @ 0x48080000)
+    # 1b. Assemble FIT using the load address required by the ARM64 Image header.
     linux_dirs = sorted(kdir.glob("linux-*"))
     if not linux_dirs:
         sys.exit(f"ERROR: linux-* directory not found under {kdir}")
@@ -151,6 +154,9 @@ def main() -> None:
     kernel_fit = kdir / "nradio_nbcpe-kernel.bin"
     kernel_lzma = kdir / ".nradio_nbcpe-kernel.lzma"
     kernel_its = kdir / "nradio_nbcpe-kernel.bin.its"
+
+    with kernel_raw.open("rb") as image:
+        validate_load_address(image.read(64), KERNEL_LOAD_ADDRESS)
 
     subprocess.run(
         [
@@ -167,8 +173,8 @@ def main() -> None:
             "-k", str(kernel_lzma),
             "-C", "lzma",
             "-d", str(dtb_dst),
-            "-a", "0x48080000",
-            "-e", "0x48080000",
+            "-a", f"{KERNEL_LOAD_ADDRESS:#x}",
+            "-e", f"{KERNEL_LOAD_ADDRESS:#x}",
             "-c", "config-1",
             "-A", "arm64",
             "-v", linux_ver,
@@ -195,7 +201,7 @@ def main() -> None:
         "  DEVICE_DTS := mt7981-nradio-nbcpe\n"
         "  DEVICE_DTS_DIR := ../dts\n"
         "  SUPPORTED_DEVICES += nradio,nbcpe\n"
-        "  KERNEL_LOADADDR := 0x48080000\n"
+        f"  KERNEL_LOADADDR := {KERNEL_LOAD_ADDRESS:#x}\n"
         f"  DEVICE_PACKAGES := {pkgs_joined}\n"
         "  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata\n"
         "endef\n"
@@ -321,21 +327,7 @@ def main() -> None:
 
     # Patch staged 02_network (lan/wan + base MAC from eMMC bdinfo)
     net_path = overlay / "etc/board.d/02_network"
-    net_text = net_path.read_text()
-    board_block = (
-        "\tnradio,nbcpe)\n"
-        "\t\tucidef_set_interfaces_lan_wan \"lan1 lan2 lan3\" \"wan\"\n"
-        "\t\t. /lib/functions/nradio-nbcpe.sh\n"
-        "\t\tlan_mac=$(nbcpe_get_base_mac)\n"
-        '\t\t[ -n "$lan_mac" ] && wan_mac=$(macaddr_add "$lan_mac" 1)\n'
-        "\t\tlabel_mac=$lan_mac\n"
-        "\t\t;;\n"
-    )
-    if "\tnradio,nbcpe)\n" not in net_text:
-        net_text = net_text.replace(
-            "\tnradio,c8-668gl)\n", board_block + "\tnradio,c8-668gl)\n", 1
-        )
-    net_path.write_text(net_text)
+    net_path.write_text(patch_board_network(net_path.read_text()))
     net_path.chmod(0o755)
 
     # Patch staged 11_fix_wifi_mac

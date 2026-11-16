@@ -27,6 +27,9 @@
 				],
 				"/sbin/sysupgrade": [
 					"exec"
+				],
+				"/usr/sbin/mt5700-sim": [
+					"exec"
 				]
 			},
 			"uci": [

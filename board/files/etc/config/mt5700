@@ -1,4 +1,5 @@
 config mt5700 'modem'
+	option transport 'ethernet'
 	option enabled '1'
 	option sim_slot 'auto'
 	option apn ''

@@ -2,6 +2,9 @@
 . /lib/functions.sh
 [ "$(board_name)" = "nradio,nbcpe" ] || exit 0
 
+# USB NCM is an opt-in transport. Ethernet ODU uses the ordinary WAN DHCP
+# client; its configuration remains exclusively in this system's p9 overlay.
+if [ "$(uci -q get mt5700.modem.transport)" = "usb" ]; then
 # 1. Configure 5G NCM wwan interface
 if ! uci -q get network.wwan >/dev/null; then
 	uci set network.wwan=interface
@@ -63,6 +66,12 @@ for up in wwan_6 wan6; do
 	uci set "dhcp.$up.ndp=relay"
 done
 uci commit dhcp
+
+else
+	uci set network.wan.label='5G 桥接上行（PoE）'
+	uci set network.wan6.label='5G 桥接上行 IPv6（同一 PoE 网口）'
+	uci commit network
+fi
 
 # 4. Tune zram-swap (lzo-rle has minimal per-CPU workspace overhead; leaving
 #    zram_size_mb unset lets /etc/init.d/zram auto-size to 50% of MemTotal,

@@ -8,6 +8,8 @@ import shutil
 import sys
 from pathlib import Path
 
+from arm64_image import KERNEL_LOAD_ADDRESS
+from network import patch_board_network
 from platform_upgrade import patch_platform_upgrade
 
 
@@ -60,18 +62,18 @@ def main() -> None:
     copy_board_files(board_dir / "files", base_files)
 
     # 3. Register Device/nradio_nbcpe in filogic.mk
-    device_block = """define Device/nradio_nbcpe
+    device_block = f"""define Device/nradio_nbcpe
   DEVICE_VENDOR := NRadio
   DEVICE_MODEL := NBCPE (WT9111)
   DEVICE_DTS := mt7981-nradio-nbcpe
   DEVICE_DTS_DIR := ../dts
   SUPPORTED_DEVICES += nradio,nbcpe
-  KERNEL_LOADADDR := 0x48080000
+  KERNEL_LOADADDR := {KERNEL_LOAD_ADDRESS:#x}
   DEVICE_PACKAGES := kmod-usb3 kmod-usb-serial-option kmod-usb-net-cdc-ether \\
 \tkmod-usb-net-cdc-ncm kmod-usb-net-huawei-cdc-ncm kmod-usb-net-rndis \\
 \tkmod-usb-net-qmi-wwan comgt-ncm uqmi \\
 \tkmod-mt7915e kmod-mt7981-firmware \\
-\tblkid e2fsprogs f2fsck mkf2fs kmod-fs-f2fs kmod-tun zram-swap
+\tblkid ucode-mod-socket e2fsprogs f2fsck mkf2fs kmod-fs-f2fs kmod-tun zram-swap
   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
 endef
 TARGET_DEVICES += nradio_nbcpe
@@ -85,29 +87,7 @@ TARGET_DEVICES += nradio_nbcpe
     # 4. Update 02_network (lan1-3 = MT7531, wan = GPY115 on switch port5,
     #    base MAC from eMMC bdinfo/factory)
     net_path = root / "target/linux/mediatek/filogic/base-files/etc/board.d/02_network"
-    net_text = net_path.read_text()
-
-    board_block = (
-        "\tnradio,nbcpe)\n"
-        "\t\tucidef_set_interfaces_lan_wan \"lan1 lan2 lan3\" \"wan\"\n"
-        "\t\t. /lib/functions/nradio-nbcpe.sh\n"
-        "\t\tlan_mac=$(nbcpe_get_base_mac)\n"
-        '\t\t[ -n "$lan_mac" ] && wan_mac=$(macaddr_add "$lan_mac" 1)\n'
-        "\t\tlabel_mac=$lan_mac\n"
-        "\t\t;;\n"
-    )
-    existing_re = re.compile(
-        r"\tnradio,nbcpe\)\n.*?\t\t;;\n(?=\tnradio,c8-668gl\))",
-        re.S,
-    )
-    if existing_re.search(net_text):
-        net_text = existing_re.sub(board_block, net_text, count=1)
-    else:
-        mac_anchor = "\tnradio,c8-668gl)\n"
-        if mac_anchor not in net_text:
-            sys.exit("ERROR: anchor missing in 02_network")
-        net_text = net_text.replace(mac_anchor, board_block + mac_anchor, 1)
-    net_path.write_text(net_text)
+    net_path.write_text(patch_board_network(net_path.read_text()))
 
     # 4b. Update 11_fix_wifi_mac (repair invalid EEPROM MACs from bdinfo base)
     wifi_mac_path = (

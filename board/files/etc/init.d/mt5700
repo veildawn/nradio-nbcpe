@@ -13,3 +13,12 @@ start_service() {
 	procd_set_param stderr 1
 	procd_close_instance
 }
+
+service_triggers() {
+	procd_add_reload_trigger "mt5700"
+}
+
+reload_service() {
+	stop
+	start
+}

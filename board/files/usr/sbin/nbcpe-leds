@@ -1,0 +1,57 @@
+#!/bin/sh
+# GPIO 11/12/13 match the factory cmode5/cmode4/wifi LED definitions.
+# Leave blue:status to OpenWrt's boot, failsafe and upgrade indication.
+. /lib/functions.sh
+[ "$(board_name)" = "nradio,nbcpe" ] || exit 0
+
+LEDS=/sys/class/leds
+RAW=/tmp/mt5700.ethernet.raw
+ERROR=/tmp/mt5700.ethernet.error
+CARRIER=/sys/class/net/wan/carrier
+
+set_led() {
+	local led="$LEDS/blue:$1" value="$2"
+	[ -w "$led/brightness" ] || return 0
+	if [ -w "$led/trigger" ] && ! grep -q '\[none\]' "$led/trigger"; then
+		printf '%s\n' none > "$led/trigger"
+	fi
+	[ "$(cat "$led/brightness")" = "$value" ] || printf '%s\n' "$value" > "$led/brightness"
+}
+
+# APs do not need a connected client to be enabled. Either band lights Wi-Fi.
+wifi=0
+ubus call network.wireless status 2>/dev/null | jsonfilter -e '@.*.up' 2>/dev/null |
+	grep -q '^true$' && wifi=1
+set_led wifi "$wifi"
+
+nr=0
+lte=0
+mtime=$(date -r "$RAW" +%s 2>/dev/null)
+now=$(date +%s)
+case "$mtime" in ''|*[!0-9]*) mtime=0 ;; esac
+if [ "$mtime" -gt 0 ] && [ "$now" -ge "$mtime" ] && [ $((now - mtime)) -le 90 ] &&
+	[ ! -s "$ERROR" ] && [ "$(cat "$CARRIER" 2>/dev/null)" = 1 ] &&
+	[ "$(uci -q get mt5700.modem.enabled)" != 0 ]; then
+	# Require SIM readiness and actual registration; a signal measurement alone
+	# does not establish a working cellular attachment. Last response wins.
+	read -r nr lte <<EOF
+$(awk '
+	/^\+CPIN:/ { sim = ($0 ~ /^\+CPIN: *READY[[:space:]]*$/) }
+	/^\+CEREG:/ {
+		split($0, a, /[:,]/); gsub(/[[:space:]]/, "", a[3]);
+		reg4 = (a[3] == "1" || a[3] == "5")
+	}
+	/^\+C5GREG:/ {
+		split($0, a, /[:,]/); gsub(/[[:space:]]/, "", a[3]);
+		reg5 = (a[3] == "1" || a[3] == "5")
+	}
+	/^\^HCSQ:/ { rat = $0 }
+	END {
+		nr = sim && (reg4 || reg5) && rat ~ /"NR"/
+		lte = sim && reg4 && rat ~ /"LTE"/
+		printf "%d %d\n", nr, lte
+	}' "$RAW")
+EOF
+fi
+set_led cmode5 "${nr:-0}"
+set_led cmode4 "${lte:-0}"
