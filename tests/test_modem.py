@@ -42,7 +42,9 @@ uci() {
             changes = calls.read_text()
             self.assertIn('network.wan.label=', changes)
             self.assertNotIn('wwan', changes)
-            self.assertNotIn('dhcp.', changes)
+            self.assertIn('dhcp.wan6.master=1', changes)
+            self.assertIn('dhcp.lan.ra=hybrid', changes)
+            self.assertNotIn('dhcp.wwan', changes)
             self.assertNotIn('firewall.', changes)
 
     def parse(self, raw):

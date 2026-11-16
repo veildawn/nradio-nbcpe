@@ -71,6 +71,28 @@ else
 	uci set network.wan.label='5G 桥接上行（PoE）'
 	uci set network.wan6.label='5G 桥接上行 IPv6（同一 PoE 网口）'
 	uci commit network
+	# This ODU supplies one on-link /64, not a delegated LAN prefix. odhcpd
+	# hybrid mode relays it when PD is absent and serves a delegated prefix
+	# normally if a future upstream supplies one. No extra physical port.
+	for proto in ra dhcpv6; do
+		uci set "dhcp.lan.$proto=hybrid"
+	done
+	uci set dhcp.lan.ndp='relay'
+	uci set dhcp.lan.ra_default='1'
+	uci set dhcp.wan6='dhcp'
+	uci set dhcp.wan6.interface='wan6'
+	uci set dhcp.wan6.ignore='1'
+	uci set dhcp.wan6.master='1'
+	uci set dhcp.wan6.ra='hybrid'
+	uci set dhcp.wan6.dhcpv6='hybrid'
+	uci set dhcp.wan6.ndp='relay'
+	uci commit dhcp
+fi
+
+# Match the included Chinese LuCI translations on a fresh installation.
+if uci -q get luci.languages.zh_cn >/dev/null; then
+	uci set luci.main.lang='zh_cn'
+	uci commit luci
 fi
 
 # 4. Tune zram-swap (lzo-rle has minimal per-CPU workspace overhead; leaving
