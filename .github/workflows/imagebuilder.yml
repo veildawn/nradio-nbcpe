@@ -52,6 +52,14 @@ jobs:
               print('json ok:', p)
           PY
 
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('.github/workflows/imagebuilder.yml') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
+
       - name: Test updater, modem snapshots and LuCI interactions
         run: |
           python3 -m pip install 'playwright>=1.50,<2'
@@ -63,15 +71,30 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential device-tree-compiler file gawk libncurses-dev python3 rsync unzip util-linux wget xz-utils zstd
 
-      - name: Download official OpenWrt Snapshot Filogic ImageBuilder
+      - name: Read ImageBuilder snapshot revision
+        id: ibver
         run: |
           mkdir -p /tmp/ib/extracted /tmp/ib/release
-          curl -fL --retry 3 -o /tmp/ib/ib.tar.zst \
-            https://downloads.openwrt.org/snapshots/targets/mediatek/filogic/openwrt-imagebuilder-mediatek-filogic.Linux-x86_64.tar.zst
           curl -fsSL https://downloads.openwrt.org/snapshots/targets/mediatek/filogic/version.buildinfo \
             -o /tmp/ib/version.buildinfo
+          echo "rev=$(tr -d ' \r\n' < /tmp/ib/version.buildinfo)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache ImageBuilder archive
+        id: ibcache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/ib/ib.tar.zst
+          key: ib-mediatek-filogic-${{ steps.ibver.outputs.rev }}
+
+      - name: Download official OpenWrt Snapshot Filogic ImageBuilder
+        if: steps.ibcache.outputs.cache-hit != 'true'
+        run: |
+          curl -fL --retry 3 -o /tmp/ib/ib.tar.zst \
+            https://downloads.openwrt.org/snapshots/targets/mediatek/filogic/openwrt-imagebuilder-mediatek-filogic.Linux-x86_64.tar.zst
+
+      - name: Extract ImageBuilder
+        run: |
           tar --use-compress-program=unzstd -xf /tmp/ib/ib.tar.zst -C /tmp/ib/extracted --strip-components=1
-          rm -f /tmp/ib/ib.tar.zst
 
       - name: Inject NRadio NBCPE board support
         run: |
