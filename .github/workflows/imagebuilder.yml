@@ -192,7 +192,7 @@ jobs:
         run: |
           BIN=/tmp/ib/release/openwrt-mediatek-filogic-nradio_nbcpe-squashfs-sysupgrade.bin
           tar -xOf "$BIN" sysupgrade-nradio_nbcpe/root > /tmp/ib/check.squashfs
-          /tmp/ib/extracted/staging_dir/host/bin/unsquashfs4 -d /tmp/ib/rootfs-check /tmp/ib/check.squashfs
+          sudo /tmp/ib/extracted/staging_dir/host/bin/unsquashfs4 -d /tmp/ib/rootfs-check /tmp/ib/check.squashfs
           python3 - <<'PY'
           from pathlib import Path
           root = Path('/tmp/ib/rootfs-check')
