@@ -117,11 +117,18 @@ fi
 # One shell pass replaces twelve sed/grep/tail pipelines on every UI poll.
 # CIMI comes before GSN: keep the first 15-digit reply as IMSI, not the IMEI.
 CFUN="" CPIN="" IMSI="" ICCID="" COPS="" CSQ="" HCSQ="" HCSQV=""
-CEREG="" C5GREG="" SCICHG="" CHIPTEMP=""
+CEREG="" C5GREG="" SCICHG="" CHIPTEMP="" IN_CPIN=0
 while IFS= read -r line; do
 	value="${line#*:}"
 	value="${value#"${value%%[![:space:]]*}"}"
 	case "$line" in
+	AT+CPIN\?) IN_CPIN=1 ;;
+	AT*) IN_CPIN=0 ;;
+	+CME\ ERROR:*)
+		if [ "$IN_CPIN" = 1 ]; then
+			case "$value" in 10|'SIM not inserted') CPIN='NOT INSERTED' ;; esac
+		fi
+		;;
 	+CFUN:*) CFUN="$value" ;;
 	+CPIN:*) CPIN="$value" ;;
 	^ICCID:*) ICCID="$value" ;;
@@ -334,6 +341,12 @@ case "$CPIN" in
 "READY")
 	SIM_PHASE="ready"
 	SIM_STATE_CN="已就绪"
+	;;
+"NOT INSERTED")
+	SIM_PHASE="absent"
+	SIM_STATE_CN="未插入 SIM 卡"
+	IMSI=""
+	ICCID=""
 	;;
 "SIM PIN")
 	SIM_PHASE="pin"

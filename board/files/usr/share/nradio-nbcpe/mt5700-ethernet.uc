@@ -156,8 +156,12 @@ try {
 		}
 		else {
 			exchange(SLOT_COMMANDS[target], true, CONTROL_TIMEOUT);
-			exchange('AT^HVSST=1,0', true, CONTROL_TIMEOUT);
-			exchange('AT^HVSST=1,1', true, CONTROL_TIMEOUT);
+			// The factory helper ignores HVSST command errors: external SIM
+			// selection can return ERROR here even after SCICHG succeeded.
+			// Only an explicit result line is optional; transport failure still
+			// aborts, and SCICHG read-back plus the reset remain mandatory.
+			exchange('AT^HVSST=1,0', false, CONTROL_TIMEOUT);
+			exchange('AT^HVSST=1,1', false, CONTROL_TIMEOUT);
 			verified_slot = read_slot();
 			if (verified_slot != target)
 				die('SIM slot read-back does not match requested target');

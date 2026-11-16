@@ -85,6 +85,12 @@ OK''')
         self.assertEqual(result['CSQ'], '18 99')
         self.assertEqual(result['HCSQV'], '60,55,100,20')
 
+    def test_absent_external_sim_is_not_an_unknown_transport_failure(self):
+        result = self.parse('AT+CPIN?\n+CME ERROR: 10\nAT^HCSQ?\n^HCSQ: "NOSERVICE"\nOK')
+        self.assertEqual(result['CPIN'], 'NOT INSERTED')
+        result = self.parse('AT+CPIN?\n+CPIN: READY\nOK\nAT+CIMI\n+CME ERROR: 10')
+        self.assertEqual(result['CPIN'], 'READY')
+
     def test_web_status_never_invokes_gcom_for_stale_snapshot(self):
         with tempfile.TemporaryDirectory(prefix='nradio-status-') as tmp:
             path = Path(tmp)

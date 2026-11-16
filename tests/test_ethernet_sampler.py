@@ -63,6 +63,10 @@ let socket = {
                     s.chunks = ['\r\n+CME ERROR: 3\r\n'];
                 else if (scenario == 'control_error_hvsst1' && command == 'AT^HVSST=1,1')
                     s.chunks = ['\r\nERROR\r\n'];
+                else if (scenario == 'control_eof_hvsst0' && command == 'AT^HVSST=1,0')
+                    s.chunks = [''];
+                else if (scenario == 'control_timeout_hvsst0' && command == 'AT^HVSST=1,0')
+                    s.chunks = [];
                 else if (scenario == 'control_error_reboot' && command == 'AT+CFUN=1,1')
                     s.chunks = ['\r\nERROR\r\n'];
                 else if (scenario == 'reboot_eof' && command == 'AT+CFUN=1,1')
@@ -240,12 +244,28 @@ class EthernetSamplerTests(unittest.TestCase):
     def test_control_errors_stop_immediately(self):
         sequence = ['AT^SCICHG?', 'AT^SCICHG=0,1', 'AT^HVSST=1,0',
                     'AT^HVSST=1,1', 'AT^SCICHG?', 'AT+CFUN=1,1']
-        for scenario, count in [('control_error_scichg', 2), ('control_error_hvsst0', 3),
-                                ('control_error_hvsst1', 4), ('control_error_reboot', 6)]:
+        for scenario, count in [('control_error_scichg', 2), ('control_error_reboot', 6)]:
             result = self.run_sampler(scenario, '--switch', 'external')
             self.assertEqual(result.returncode, 1, result.stderr)
             self.assertEqual(result.stdout, '')
             self.assertEqual(self.sent_commands(result), sequence[:count])
+
+    def test_hvsst_error_is_optional_but_slot_readback_and_reset_still_run(self):
+        for scenario in ['control_error_hvsst0', 'control_error_hvsst1']:
+            result = self.run_sampler(scenario, '--switch', 'external')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), dict(state='restarting', target='external',
+                                                           slot='external', reboot='acknowledged'))
+            self.assertEqual(self.sent_commands(result), ['AT^SCICHG?', 'AT^SCICHG=0,1',
+                'AT^HVSST=1,0', 'AT^HVSST=1,1', 'AT^SCICHG?', 'AT+CFUN=1,1'])
+
+    def test_hvsst_transport_failure_still_aborts_without_reset(self):
+        for scenario in ['control_eof_hvsst0', 'control_timeout_hvsst0']:
+            result = self.run_sampler(scenario, '--switch', 'external')
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(result.stdout, '')
+            self.assertEqual(self.sent_commands(result), ['AT^SCICHG?', 'AT^SCICHG=0,1',
+                                                         'AT^HVSST=1,0'])
 
     def test_slot_must_be_unambiguous_before_any_write(self):
         for scenario in ['slot_invalid', 'slot_ambiguous', 'slot_equal_pair']:
