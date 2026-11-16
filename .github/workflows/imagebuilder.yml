@@ -146,8 +146,8 @@ jobs:
               assert any(n.endswith("/CONTROL") for n in names) and any(n.endswith("/kernel") for n in names) and any(n.endswith("/root") for n in names), names
               kernel = tf.extractfile("sysupgrade-nradio_nbcpe/kernel").read(8)
               assert kernel[:4] == b"\xd0\x0d\xfe\xed", "kernel member must be a FIT image for kernel_2nd"
-              root = tf.extractfile("sysupgrade-nradio_nbcpe/root")
-              header = root.read(48)
+              root = tf.getmember("sysupgrade-nradio_nbcpe/root")
+              header = tf.extractfile(root).read(48)
               assert header[:4] == b"hsqs", "rootfs_2nd rootdisk requires SquashFS"
               bytes_used = struct.unpack_from("<Q", header, 40)[0]
               assert 0 < bytes_used <= root.size
