@@ -64,7 +64,7 @@ window.fs = { async exec(path, args = []) {
     if (path.endsWith('bootswitch')) {
         if (command === 'to-factory') fake.boot = '0';
         if (command === 'to-openwrt') fake.boot = '1';
-        return {code: 0, stdout: `mtd=/dev/mtd1 boot_from_sd=${fake.boot} (test)`};
+        return {code: 0, stdout: `boot_system=${fake.boot} (${fake.boot === '1' ? 'openwrt-second-system' : 'factory-system'})`};
     }
     if (command === 'modem') data = fake.modem;
     if (command === 'check') {
@@ -161,12 +161,19 @@ class UITests(unittest.TestCase):
         self.assertTrue(self.page.get_by_role('button', name='下载固件到路由器').is_disabled())
         self.assertTrue(self.page.get_by_role('button', name='重新检查').is_disabled())
 
-    def test_kernel_unknown_and_mismatch_disable_download(self):
+    def test_kernel_mismatch_allows_download_with_warning(self):
         self.mount('upgrade')
         self.page.wait_for_function('!current.checking')
-        for match in (0, -1):
-            self.page.evaluate('(match) => { fake.release.kernel_match = match; return current.handleCheck(true); }', match)
-            self.assertTrue(self.page.get_by_role('button', name='下载固件到路由器').is_disabled())
+        # NBCPE sysupgrade refreshes kernel_2nd too, so a kernel-mismatched
+        # release stays downloadable; only an informational banner is shown.
+        self.page.evaluate('(match) => { fake.release.kernel_match = match; return current.handleCheck(true); }', 0)
+        self.assertTrue(self.page.get_by_role('button', name='下载固件到路由器').is_enabled())
+        self.assertIn('跨内核版本提示', self.page.locator('body').inner_text())
+        self.assertIn('kernel_2nd 与 rootfs_2nd', self.page.locator('body').inner_text())
+        # Unknown remote kernel: no banner, still downloadable
+        self.page.evaluate('(match) => { fake.release.kernel_match = match; return current.handleCheck(true); }', -1)
+        self.assertNotIn('跨内核版本提示', self.page.locator('body').inner_text())
+        self.assertTrue(self.page.get_by_role('button', name='下载固件到路由器').is_enabled())
         self.page.evaluate("fake.fail = 'check'; current.handleCheck(true)")
         self.assertTrue(self.page.get_by_role('button', name='重新检查').is_enabled())
         self.assertIn('重试', self.page.locator('body').inner_text())
